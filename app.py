@@ -12,7 +12,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- API Key 處理 (自動解碼新金鑰) ---
+# --- API Key 處理 (自動解碼) ---
 # 使用您提供的最新 Base64 金鑰
 RAW_B64_KEY = "NGFhMmQ2MTktNTIwYy00ZGEzLTk5NjQtNDg2YWU4MGFjMDk0IDc1YzEzNjgwLWYxNGQtNDFjZS04ZTIwLTY0YWE0MDU4Y2FhYQ=="
 try:
@@ -37,7 +37,7 @@ st.markdown("""
 # --- 數據獲取函數 ---
 @st.cache_data(ttl=300)
 def fetch_us_context():
-    """獲取美股前夜連動數據 (TSM ADR, SOXX)"""
+    """獲取美股前夜連動數據"""
     try:
         tsm = yf.Ticker("TSM").history(period="2d")
         soxx = yf.Ticker("SOXX").history(period="2d")
@@ -68,19 +68,16 @@ def get_tick_size(price):
     else: return 5.0
 
 def analyze_strategy(price, adr_change, discount=0.6):
-    """綜合美股、成本與跳檔的分析模型 (預設 6 折)"""
+    """綜合決策模型 (預設 6 折)"""
     fee_rate = 0.001425 * discount
-    tax_rate = 0.0015 # 當沖減半
-    # 總交易成本率：(買手續費 + 賣手續費 + 交易稅)
+    tax_rate = 0.0015
     total_cost_rate = (fee_rate * 2) + tax_rate
     
     breakeven = price * (1 + total_cost_rate)
     tick = get_tick_size(price)
     
-    # 根據美股 ADR 決定建議偏向
     bias = "多方" if adr_change > 0 else "空方"
     
-    # 點位建議
     entry = price - tick if bias == "多方" else price + tick
     target = price + (tick * 4) if bias == "多方" else price - (tick * 4)
     stop = price - (tick * 3) if bias == "多方" else price + (tick * 3)
@@ -91,7 +88,6 @@ def analyze_strategy(price, adr_change, discount=0.6):
 def main():
     st.markdown("### 🚀 台股 AI 全方位實戰系統")
     
-    # 1. 美股連動區
     tsm_c, soxx_c = fetch_us_context()
     st.markdown(f"""
     <div class="us-market-card">
@@ -101,14 +97,11 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # 2. 標的選擇
     stocks = {"2449": "京元電子", "2337": "旺宏", "2303": "聯電", "2317": "鴻海", "2330": "台積電", "3711": "日月光"}
     selected_id = st.selectbox("監控標的", list(stocks.keys()), format_func=lambda x: f"{x} {stocks[x]}")
     
-    # 手續費折扣 (預設 6 折)
     discount = st.sidebar.slider("券商折扣", 0.1, 1.0, 0.6)
     
-    # 3. 實時抓取與分析
     data = fetch_stock_snapshot(selected_id)
     
     if data:
@@ -124,17 +117,15 @@ def main():
             
         be_p, entry, target, stop, bias = analyze_strategy(curr_p, tsm_c, discount)
         
-        # 4. 決策卡片
         st.markdown(f"""
         <div class="card recommend-box">
             <h4 style="margin-top:0; color:#58a6ff;">🤖 AI 實戰分析報告</h4>
             <p>目前趨勢：<b style="color:{'#3fb950' if bias=='多方' else '#f85149'}">{bias}優先</b></p>
             <p>當沖損平點：<b class="profit-text">{be_p:.2f}</b> (在此之上才賺錢)</p>
-            <p style="font-size:0.8rem; color:#8b949e;">* 手續費 {discount*10:.1f} 折 | 已計算當沖稅 0.15%</p>
+            <p style="font-size:0.8rem; color:#8b949e;">* 6 折手續費 | 當沖稅 0.15%</p>
         </div>
         """, unsafe_allow_html=True)
         
-        # 5. 點位提示
         c1, c2, c3 = st.columns(3)
         c1.markdown(f"<div style='text-align:center'><small>建議進場</small><br><b style='color:#3fb950; font-size:20px'>{entry:.1f}</b></div>", unsafe_allow_html=True)
         c2.markdown(f"<div style='text-align:center'><small>短線停利</small><br><b style='color:#539bf5; font-size:20px'>{target:.1f}</b></div>", unsafe_allow_html=True)
@@ -143,20 +134,9 @@ def main():
         if st.button("🔄 手動更新報價"):
             st.rerun()
             
-        st.caption(f"系統狀態：Fugle 實時數據連線中 | 更新時間：{datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"更新時間：{datetime.now().strftime('%H:%M:%S')}")
     else:
-        st.error("連線超時，請檢查富果開發者中心 API Key 是否已驗證開通。")
+        st.error("連線超時，請檢查 API Key。")
 
 if __name__ == "__main__":
     main()
-```
-
-### 覆蓋與部署步驟提醒：
-
-1.  **覆蓋 GitHub**：點擊 `app.py` 的編輯圖示（鉛筆），將舊內容全部刪除，貼上這段新程式碼，然後 **Commit changes**。
-2.  **確認 `requirements.txt`**：請確保該檔案內容依然是以下四行：
-    ```text
-    streamlit
-    pandas
-    requests
-    yfinance
