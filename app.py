@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import pandas as pd
 import requests
@@ -12,14 +13,22 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- API Key 處理 (自動解碼) ---
-# 使用您提供的最新 Base64 金鑰
+# --- API Key 處理邏輯 ---
+# 這是您提供的最新 Base64 金鑰
 RAW_B64_KEY = "NGFhMmQ2MTktNTIwYy00ZGEzLTk5NjQtNDg2YWU4MGFjMDk0IDc1YzEzNjgwLWYxNGQtNDFjZS04ZTIwLTY0YWE0MDU4Y2FhYQ=="
-try:
-    decoded_key = base64.b64decode(RAW_B64_KEY).decode('utf-8').split(' ')[0]
-    FUGLE_API_KEY = decoded_key
-except:
-    FUGLE_API_KEY = ""
+
+def get_default_key():
+    try:
+        decoded = base64.b64decode(RAW_B64_KEY).decode('utf-8')
+        # 嘗試抓取第一段或整段
+        return decoded.split(' ')[0]
+    except:
+        return ""
+
+# 優先順序：側邊欄手動輸入 > 程式內解碼
+st.sidebar.header("🔑 金鑰設定")
+manual_key = st.sidebar.text_input("手動輸入 Fugle API Key", value="", type="password", help="如果下方顯示連線超時，請直接從富果官網複製 Key 貼於此處")
+FUGLE_API_KEY = manual_key if manual_key else get_default_key()
 
 # --- iPhone 專屬深色模式 UI 樣式 ---
 st.markdown("""
@@ -37,7 +46,6 @@ st.markdown("""
 # --- 數據獲取函數 ---
 @st.cache_data(ttl=300)
 def fetch_us_context():
-    """獲取美股前夜連動數據"""
     try:
         tsm = yf.Ticker("TSM").history(period="2d")
         soxx = yf.Ticker("SOXX").history(period="2d")
@@ -53,8 +61,14 @@ def fetch_stock_snapshot(symbol):
     url = f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/{symbol}"
     headers = {"X-API-KEY": FUGLE_API_KEY}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
-        return res.json() if res.status_code == 200 else None
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            return res.json()
+        elif res.status_code == 401:
+            st.error("API Key 認證失敗，請檢查金鑰是否正確。")
+            return None
+        else:
+            return None
     except:
         return None
 
@@ -68,20 +82,15 @@ def get_tick_size(price):
     else: return 5.0
 
 def analyze_strategy(price, adr_change, discount=0.6):
-    """綜合決策模型 (預設 6 折)"""
     fee_rate = 0.001425 * discount
     tax_rate = 0.0015
     total_cost_rate = (fee_rate * 2) + tax_rate
-    
     breakeven = price * (1 + total_cost_rate)
     tick = get_tick_size(price)
-    
     bias = "多方" if adr_change > 0 else "空方"
-    
     entry = price - tick if bias == "多方" else price + tick
     target = price + (tick * 4) if bias == "多方" else price - (tick * 4)
     stop = price - (tick * 3) if bias == "多方" else price + (tick * 3)
-    
     return breakeven, entry, target, stop, bias
 
 # --- App 主介面 ---
@@ -102,7 +111,8 @@ def main():
     
     discount = st.sidebar.slider("券商折扣", 0.1, 1.0, 0.6)
     
-    data = fetch_stock_snapshot(selected_id)
+    with st.spinner("連線數據庫中..."):
+        data = fetch_stock_snapshot(selected_id)
     
     if data:
         curr_p = data.get('lastPrice', 0)
@@ -121,8 +131,8 @@ def main():
         <div class="card recommend-box">
             <h4 style="margin-top:0; color:#58a6ff;">🤖 AI 實戰分析報告</h4>
             <p>目前趨勢：<b style="color:{'#3fb950' if bias=='多方' else '#f85149'}">{bias}優先</b></p>
-            <p>當沖損平點：<b class="profit-text">{be_p:.2f}</b> (在此之上才賺錢)</p>
-            <p style="font-size:0.8rem; color:#8b949e;">* 6 折手續費 | 當沖稅 0.15%</p>
+            <p>當沖損平點：<b class="profit-text">{be_p:.2f}</b> (在此之上才獲利)</p>
+            <p style="font-size:0.8rem; color:#8b949e;">* 手續費 6 折 | 已計當沖稅 0.15%</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -131,12 +141,14 @@ def main():
         c2.markdown(f"<div style='text-align:center'><small>短線停利</small><br><b style='color:#539bf5; font-size:20px'>{target:.1f}</b></div>", unsafe_allow_html=True)
         c3.markdown(f"<div style='text-align:center'><small>強勢停損</small><br><b style='color:#f85149; font-size:20px'>{stop:.1f}</b></div>", unsafe_allow_html=True)
 
-        if st.button("🔄 手動更新報價"):
+        if st.button("🔄 立即更新報價"):
             st.rerun()
             
         st.caption(f"更新時間：{datetime.now().strftime('%H:%M:%S')}")
     else:
-        st.error("連線超時，請檢查 API Key。")
+        st.warning("⚠️ 數據尚未讀取。請確認 API Key 是否正確，或點擊左上角箭頭展開選單手動輸入 Key。")
 
 if __name__ == "__main__":
     main()
+
+```
