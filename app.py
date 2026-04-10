@@ -12,10 +12,10 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- API Key 處理 (自動解碼) ---
-RAW_B64_KEY = "YjVjMjU4OTAtMmMyZC00YzJlLTg1YjctYjAzN2I3ZDU5ZDc2IGI0MzBhMGRiLWVmNDAtNGM1OC04YWNlLTYwNWVjM2RlNmNiYg=="
+# --- API Key 處理 (自動解碼新金鑰) ---
+# 使用您提供的最新 Base64 金鑰
+RAW_B64_KEY = "NGFhMmQ2MTktNTIwYy00ZGEzLTk5NjQtNDg2YWU4MGFjMDk0IDc1YzEzNjgwLWYxNGQtNDFjZS04ZTIwLTY0YWE0MDU4Y2FhYQ=="
 try:
-    # 這裡會解碼出您的 Fugle API Key
     decoded_key = base64.b64decode(RAW_B64_KEY).decode('utf-8').split(' ')[0]
     FUGLE_API_KEY = decoded_key
 except:
@@ -68,9 +68,10 @@ def get_tick_size(price):
     else: return 5.0
 
 def analyze_strategy(price, adr_change, discount=0.6):
-    """綜合美股、成本與跳檔的分析模型"""
+    """綜合美股、成本與跳檔的分析模型 (預設 6 折)"""
     fee_rate = 0.001425 * discount
     tax_rate = 0.0015 # 當沖減半
+    # 總交易成本率：(買手續費 + 賣手續費 + 交易稅)
     total_cost_rate = (fee_rate * 2) + tax_rate
     
     breakeven = price * (1 + total_cost_rate)
@@ -129,7 +130,7 @@ def main():
             <h4 style="margin-top:0; color:#58a6ff;">🤖 AI 實戰分析報告</h4>
             <p>目前趨勢：<b style="color:{'#3fb950' if bias=='多方' else '#f85149'}">{bias}優先</b></p>
             <p>當沖損平點：<b class="profit-text">{be_p:.2f}</b> (在此之上才賺錢)</p>
-            <p style="font-size:0.8rem; color:#8b949e;">* 已計算 6 折手續費與 0.15% 交易稅</p>
+            <p style="font-size:0.8rem; color:#8b949e;">* 手續費 {discount*10:.1f} 折 | 已計算當沖稅 0.15%</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -142,9 +143,20 @@ def main():
         if st.button("🔄 手動更新報價"):
             st.rerun()
             
-        st.caption(f"系統狀態：實時數據連線中 | 更新時間：{datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"系統狀態：Fugle 實時數據連線中 | 更新時間：{datetime.now().strftime('%H:%M:%S')}")
     else:
-        st.error("連線超時，請檢查 API Key 權限。")
+        st.error("連線超時，請檢查富果開發者中心 API Key 是否已驗證開通。")
 
 if __name__ == "__main__":
     main()
+```
+
+### 覆蓋與部署步驟提醒：
+
+1.  **覆蓋 GitHub**：點擊 `app.py` 的編輯圖示（鉛筆），將舊內容全部刪除，貼上這段新程式碼，然後 **Commit changes**。
+2.  **確認 `requirements.txt`**：請確保該檔案內容依然是以下四行：
+    ```text
+    streamlit
+    pandas
+    requests
+    yfinance
