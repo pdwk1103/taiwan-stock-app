@@ -8,9 +8,9 @@ from datetime import datetime
 # --- 基本設定 ---
 st.set_page_config(page_title="台股實戰系統")
 
-# --- 萬能金鑰處理解碼器 ---
+# --- 萬用金鑰處理解碼器 ---
 # 這是您截圖中最新申請的那串金鑰
-RAW_B64 = "ODUxMTgzOTMtZjJlMi00NTRhLTgxZDItMzY4MmQzZDA4NTAzZDA0YzRkZTU3LTNmNDVjM2JiYjLWNlZTIzZTI1ZTI1ZDA=="
+RAW_B64 = "NGFhMmQ2MTktNTIwYy00ZGEzLTk5NjQtNDg2YWU4MGFjMDk0IDc1YzEzNjgwLWYxNGQtNDFjZS04ZTIwLTY0YWE0MDU4Y2FhYQ=="
 
 def get_valid_key():
     try:
@@ -39,11 +39,15 @@ def fetch_adr():
 
 def fetch_realtime(symbol):
     if not FUGLE_KEY: return {"error": "NoKey"}
+    # 富果 v1.0 快照 API 路徑
     url = f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/{symbol}"
     headers = {"X-API-KEY": FUGLE_KEY}
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        return res.json() if res.status_code == 200 else {"error": res.status_code, "msg": res.text}
+        if res.status_code == 200:
+            return res.json()
+        else:
+            return {"error": res.status_code, "msg": res.text}
     except:
         return {"error": "Timeout"}
 
@@ -69,6 +73,7 @@ if data and "error" not in data:
     c2.metric("總量", f"{data.get('totalVolume'):,}")
 
     # 決策計算 (6 折)
+    # 總成本率 = (手續費率 * 折扣 * 2) + 交易稅率
     be = price * (1 + (0.001425 * discount * 2 + 0.0015))
     tick = 0.5 if price >= 100 else 0.1
     
@@ -93,4 +98,3 @@ else:
         """)
 
 st.caption(f"最後更新：{datetime.now().strftime('%H:%M:%S')}")
-
