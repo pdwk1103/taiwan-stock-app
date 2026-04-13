@@ -10,7 +10,7 @@ st.set_page_config(page_title="台股實戰系統")
 
 # --- 萬能金鑰處理解碼器 ---
 # 這是您截圖中最新申請的那串金鑰
-RAW_B64 = "ODUxMTgzOTMtZjJlMi00NTRhLTgxZDItMzY4MmQzZDA4NTAzZDA0YzRkZTU3LTNmNDVjM2JiYjLWNlZTIzZTI1ZTI1ZDA="
+RAW_B64 = "ODUxMTgzOTMtZjJlMi00NTRhLTgxZDItMzY4MmQzZDA4NTAzZDA0YzRkZTU3LTNmNDVjM2JiYjLWNlZTIzZTI1ZTI1ZDA=="
 
 def get_valid_key():
     try:
