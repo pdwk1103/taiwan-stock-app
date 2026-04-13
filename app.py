@@ -9,7 +9,7 @@ from datetime import datetime
 st.set_page_config(page_title="台股實戰 AI 決策", layout="centered")
 
 # --- API KEY 處理 (更新為您最新的 8511 序號) ---
-RAW_B64_KEY = "ODUxMTgzOTMtZjJlMi00NTRhLTgxZDItMzY4MmQzZDA4NTAzZDA0YzRkZTU3LTNmNDVjM2JiYjLWNlZTIzZTI1ZTI1ZDA="
+RAW_B64_KEY = "ODUxMTgzOTMtZjJlMi00NTRhLTgxZDItMzY4MmQzZDA4NTAzZDA0YzRkZTU3LTNmNDVjM2JiYjLWNlZTIzZTI1ZTI1ZDA=="
 
 def get_latest_key():
     try:
