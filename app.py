@@ -2,34 +2,56 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
+import json
 from datetime import datetime
 from google.cloud import firestore
 from google.oauth2 import service_account
 
-# --- 頁面配置 (優化手機檢視) ---
+# --- 頁面配置 ---
 st.set_page_config(page_title="台股 AI 雲端實戰", layout="centered", initial_sidebar_state="collapsed")
 
 # --- Firebase / Firestore 初始化 ---
 @st.cache_resource
-def init_firestore():
+def init_db_connection():
     """初始化雲端資料庫連線"""
     try:
         if "firebase" in st.secrets:
-            # 將 Secrets 轉為字典
             creds_dict = dict(st.secrets["firebase"])
-            # 處理 private_key 可能出現的轉義字元
+            # 確保私鑰換行符號正確
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-            
             creds = service_account.Credentials.from_service_account_info(creds_dict)
             return firestore.Client(credentials=creds)
     except Exception as e:
+        st.error(f"資料庫配置錯誤: {e}")
         return None
     return None
 
-db = init_firestore()
+db = init_db_connection()
+# 取得 App ID
 app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v2")
 
-# --- 跳檔級距 (Tick Size) ---
+# --- 雲端數據存取 (修正路徑以符合 Rule 1) ---
+def cloud_save(uid, portfolio):
+    if not db: return
+    try:
+        # 正確路徑規則: /artifacts/{appId}/users/{userId}/{collectionName}
+        # 這裡將 'portfolio' 作為集合名稱，'data' 作為唯一的文檔
+        doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
+        doc_ref.set({"items": portfolio, "last_updated": datetime.now()})
+    except Exception as e:
+        st.error(f"雲端寫入失敗 (權限拒絕): {e}")
+        st.info("請確認您的 Firebase 安全規則是否允許寫入該路徑。")
+
+def cloud_load(uid):
+    if not db: return []
+    try:
+        doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
+        doc = doc_ref.get()
+        return doc.to_dict().get("items", []) if doc.exists else []
+    except Exception:
+        return []
+
+# --- 核心跳檔級距 ---
 def get_tick(p):
     if p < 10: return 0.01
     elif p < 50: return 0.05
@@ -38,40 +60,24 @@ def get_tick(p):
     elif p < 1000: return 1.0
     else: return 5.0
 
-# --- 技術指標計算 (MA + KD + MACD) ---
+# --- 技術指標計算 ---
 def compute_indicators(df):
     if len(df) < 35: return df
-    # 均線
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    # KD (9, 3, 3)
+    # KD
     low_min = df['Low'].rolling(window=9).min()
     high_max = df['High'].rolling(window=9).max()
     df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
     df['K'] = df['RSV'].ewm(com=2).mean()
     df['D'] = df['K'].ewm(com=2).mean()
-    # MACD (12, 26, 9)
+    # MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['DIF'] = exp1 - exp2
     df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
     df['MACD'] = (df['DIF'] - df['DEA']) * 2
     return df
-
-# --- 雲端數據存取邏輯 ---
-def cloud_save(uid, portfolio):
-    if not db: return
-    # 強制路徑：/artifacts/{appId}/users/{userId}/data/portfolio
-    doc_ref = db.document(f"artifacts/{app_id}/users/{uid}/data/portfolio")
-    doc_ref.set({"items": portfolio, "last_updated": datetime.now()})
-
-def cloud_load(uid):
-    if not db: return []
-    try:
-        doc_ref = db.document(f"artifacts/{app_id}/users/{uid}/data/portfolio")
-        doc = doc_ref.get()
-        return doc.to_dict().get("items", []) if doc.exists else []
-    except: return []
 
 # --- 市場搜尋與 ADR 分析 ---
 @st.cache_data(ttl=3600)
@@ -121,7 +127,6 @@ if mode == "📢 AI 盤前推薦":
                 if df.empty: continue
                 last, prev = df.iloc[-1], df.iloc[-2]
                 
-                # AI 綜合買訊分值
                 score = 50
                 if last['Close'] > last['MA5']: score += 15
                 if last['K'] > last['D'] and prev['K'] <= prev['D']: score += 15
@@ -157,9 +162,9 @@ else:
 
     with st.expander("➕ 新增個人持倉", expanded=False):
         c1, c2, c3 = st.columns([2, 2, 1])
-        new_sid = c1.text_input("代號或名稱")
-        new_cost = c2.number_input("平均成本", min_value=0.0, step=0.1)
-        if c3.button("存入"):
+        new_sid = c1.text_input("代號或名稱", key="add_sid_input")
+        new_cost = c2.number_input("平均成本", min_value=0.0, step=0.1, key="add_cost_input")
+        if c3.button("存入", key="save_btn"):
             sym, name = find_stock(new_sid)
             if sym:
                 st.session_state.portfolio_list.append({"symbol": sym, "name": name, "cost": new_cost})
@@ -182,20 +187,19 @@ else:
                 profit = ((curr_p - stock['cost']) / stock['cost']) * 100
                 tk = get_tick(curr_p)
                 
-                # 診斷狀態分析
                 d_status, d_action, d_color = "", "", "#ffffff"
-                if profit > 0: # 獲利
+                if profit > 0:
                     if last['MACD'] > 0 and last['K'] > last['D']:
-                        d_status, d_action, d_color = "🚀 強勢續強", f"指標維持多頭。建議續留讓獲利奔跑。目標上看 {curr_p + tk*10}", "#3fb950"
+                        d_status, d_action, d_color = "🚀 強勢續強", f"指標多頭。建議續留。目標上看 {curr_p + tk*10}", "#3fb950"
                     else:
-                        d_status, d_action, d_color = "⚠️ 漲勢轉弱", "指標出現轉折訊號。建議分批減碼獲利了結。", "#f0883e"
-                else: # 虧損
+                        d_status, d_action, d_color = "⚠️ 漲勢轉弱", "指標轉折。建議分批減碼獲利了結。", "#f0883e"
+                else:
                     if last['MACD'] > 0 or (last['K'] > last['D'] and last['K'] < 30):
-                        d_status, d_action, d_color = "💪 底部轉強", "目前虧損但技術面已現轉機指標，建議續抱等待解套。", "#58a6ff"
+                        d_status, d_action, d_color = "💪 底部轉強", "虧損但技術面現轉機，建議續抱等待解套。", "#58a6ff"
                     elif curr_p < last['MA20']:
-                        d_status, d_action, d_color = "🚨 趨勢走壞", "股價跌破關鍵均線支撐。為了資金安全，建議果斷止損離場。", "#f85149"
+                        d_status, d_action, d_color = "🚨 趨勢走壞", "跌破關鍵均線。為了資金安全，建議果斷止損。", "#f85149"
                     else:
-                        d_status, d_action, d_color = "💤 盤整待變", "尚在盤整區域。只要不破今日低點，可持股觀察動能。", "#8b949e"
+                        d_status, d_action, d_color = "💤 盤整待變", "盤整區域。只要不破今日低點可觀望。", "#8b949e"
 
                 st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border-left:8px solid {d_color}; margin-bottom:12px;">
                     <div style="display:flex; justify-content:space-between;"><b>{stock['name']}</b><b style="color:{d_color};">{d_status}</b></div>
