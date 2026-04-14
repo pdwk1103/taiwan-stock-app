@@ -1,4 +1,5 @@
-streamlit>=1.30.0
-yfinance>=0.2.36
+streamlit
 pandas
 requests
+yfinance
+google-cloud-firestore
