@@ -235,4 +235,3 @@ else:
     st.error("❌ 無法獲取該標的數據，可能目前非開盤時間或 Yahoo 伺服器繁忙。")
 
 st.caption(f"數據源：Yahoo Finance (延遲 15 分) | 系統時間：{datetime.now().strftime('%H:%M:%S')}")
-
