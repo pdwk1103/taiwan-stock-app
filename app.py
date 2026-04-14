@@ -4,84 +4,101 @@ import requests
 import yfinance as yf
 from datetime import datetime
 
-# --- 基本頁面設定 ---
-st.set_page_config(page_title="台股 AI 實戰", layout="centered")
+# --- 頁面初始設定 ---
+st.set_page_config(page_title="台股 AI 多源驗證系統", layout="centered")
 
-# --- 原始金鑰直接填入 (這就是從你那串 Base64 解碼出來的) ---
-FUGLE_API_KEY = "4f1b5371-6a2d-4253-8eb0-373e0858f210"
+# --- 金鑰與設定 ---
+# 這是從你最新提供的 Base64 解碼出來的原始 UUID
+DEFAULT_FUGLE_KEY = "4f1b5371-6a2d-4253-8eb0-373e0858f210"
 
-# 側邊欄：實戰參數校準
-st.sidebar.title("🛠️ 實戰設定")
-manual_k = st.sidebar.text_input("手動更換 API Key", value="", type="password")
-discount = st.sidebar.slider("券商手續費折扣", 0.1, 1.0, 0.6)
-# 如果手動欄位有填，就用手動的，否則用上面的預設值
-FINAL_KEY = manual_k if manual_k else FUGLE_API_KEY
+st.sidebar.title("🛠️ 數據源校準")
+provider = st.sidebar.radio("選擇數據來源", ["Yahoo Finance (免金鑰/延遲)", "Fugle 富果 (需金鑰/實時)"])
+discount = st.sidebar.slider("券商折扣", 0.1, 1.0, 0.6)
+manual_key = st.sidebar.text_input("手動更換 Fugle Key", value="", type="password")
+FINAL_KEY = manual_key if manual_key else DEFAULT_FUGLE_KEY
 
-# --- 數據獲取函數 ---
-def fetch_adr():
-    """抓取前夜台積電 ADR 漲跌"""
+# --- 數據抓取函數 ---
+
+def fetch_yahoo_data(symbol):
+    """使用 Yahoo Finance 獲取數據 (免金鑰)"""
     try:
-        tsm = yf.Ticker("TSM").history(period="2d")
-        return ((tsm['Close'].iloc[-1] - tsm['Close'].iloc[-2]) / tsm['Close'].iloc[-2]) * 100
+        # 台股代碼在 Yahoo 需要加 .TW
+        ticker = yf.Ticker(f"{symbol}.TW")
+        df = ticker.history(period="1d")
+        if not df.empty:
+            return {
+                "price": round(df['Close'].iloc[-1], 2),
+                "change": round(((df['Close'].iloc[-1] - df['Open'].iloc[-1]) / df['Open'].iloc[-1]) * 100, 2),
+                "volume": int(df['Volume'].iloc[-1])
+            }
+        return None
     except:
-        return 0.0
+        return None
 
-def fetch_realtime(symbol):
-    """抓取富果即時快照 (支援自動校正格式)"""
-    if not FINAL_KEY: return None
-    # 嘗試兩種常見的 API 路徑格式
-    for sym in [symbol, f"{symbol}.TW"]:
-        url = f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/{sym}"
+def fetch_fugle_data(symbol):
+    """使用 Fugle API 獲取數據"""
+    if not FINAL_KEY: return {"error": "NoKey"}
+    # 嘗試兩種路徑格式
+    for s in [symbol, f"{symbol}.TW"]:
+        url = f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/{s}"
         headers = {"X-API-KEY": FINAL_KEY}
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                return res.json()
+                data = res.json()
+                return {
+                    "price": data.get('lastPrice'),
+                    "change": data.get('changePercent'),
+                    "volume": data.get('totalVolume')
+                }
         except:
             continue
-    return {"error": 404}
+    return {"error": "ConnectFail"}
 
-# --- iPhone 主介面 ---
-st.title("🚀 台股 AI 決策系統")
+# --- 主介面 ---
+st.title("🚀 台股 AI 決策驗證系統")
 
-# 1. 前夜美股連動
-adr_pct = fetch_adr()
-st.info(f"🌐 前夜台積電 ADR 連動：{adr_pct:+.2f}%")
-
-# 2. 標的選取
+# 1. 標的選擇
 stocks = {"2449": "京元電子", "2330": "台積電", "2317": "鴻海", "2303": "聯電", "3711": "日月光"}
-target = st.selectbox("監控標的", list(stocks.keys()), format_func=lambda x: f"{x} {stocks[x]}")
+target_id = st.selectbox("選取監控標的", list(stocks.keys()), format_func=lambda x: f"{x} {stocks[x]}")
 
-# 3. 執行即時分析
-with st.spinner("連線數據庫中..."):
-    data = fetch_realtime(target)
+# 2. 根據選擇的來源抓取數據
+st.write(f"📡 目前使用來源：**{provider}**")
 
-if data and "error" not in data:
-    p = data.get('lastPrice', 0)
+with st.spinner("正在獲取數據..."):
+    if "Yahoo" in provider:
+        stock_data = fetch_yahoo_data(target_id)
+    else:
+        stock_data = fetch_fugle_data(target_id)
+
+# 3. 顯示結果
+if stock_data and "error" not in stock_data:
+    price = stock_data['price']
+    
     st.divider()
-    c1, c2 = st.columns(2)
-    c1.metric("即時價", f"{p}", f"{data.get('changePercent')}%")
-    c2.metric("總量", f"{data.get('totalVolume'):,}")
+    col1, col2 = st.columns(2)
+    col1.metric("即時/延遲價", f"{price}", f"{stock_data['change']}%")
+    col2.metric("成交量", f"{stock_data['volume']:,}")
 
-    # 4. 決策模型 (6折成本計算)
-    # 損平比率 = (買手續費率 + 賣手續費率 + 交易稅率 0.15%)
-    # 公式：價格 * (1 + 0.001425 * 0.6 * 2 + 0.0015)
-    be = p * (1 + (0.001425 * discount * 2 + 0.0015))
-    tick = 0.5 if p >= 100 else 0.1
+    # 4. AI 決策模型
+    # 當沖成本 = 手續費(買+賣)*折扣 + 交易稅(0.15%)
+    cost_rate = (0.001425 * discount * 2) + 0.0015
+    be_price = price * (1 + cost_rate)
+    tick = 0.5 if price >= 100 else 0.1
     
-    st.success(f"🤖 AI 建議：當沖損平點 {be:.2f}")
+    st.success(f"🤖 AI 建議：當沖損平點 {be_price:.2f}")
     
-    # 點位提示
     t1, t2, t3 = st.columns(3)
-    t1.error(f"停損\n{p - tick*3:.1f}")
-    t2.warning(f"進場\n{p - tick:.1f}")
-    t3.success(f"停利\n{p + tick*4:.1f}")
+    t1.error(f"停損\n{price - tick*3:.1f}")
+    t2.warning(f"進場\n{price - tick:.1f}")
+    t3.success(f"停利\n{price + tick*4:.1f}")
 
-    if st.button("🔄 手動更新報價"):
-        st.rerun()
 else:
-    st.error("⚠️ 數據讀取失敗。請檢查 API Key 權限或網路。")
-    if data and "error" in data:
-        st.write(f"錯誤代碼: {data['error']}")
+    st.error("❌ 數據讀取失敗")
+    if "Fugle" in provider:
+        st.warning("提示：Fugle 連線失敗。這通常代表 API Key 尚未生效或權限不足。")
+        st.info("建議：請切換到 Yahoo Finance 來源，確認 App 本身功能是否正常。")
+    else:
+        st.warning("提示：Yahoo 暫時無法獲取數據，請稍後再試。")
 
 st.caption(f"最後更新：{datetime.now().strftime('%H:%M:%S')}")
