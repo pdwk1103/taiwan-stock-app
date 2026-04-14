@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import json
+import time
 from datetime import datetime
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -22,7 +23,6 @@ def init_db_connection():
             creds = service_account.Credentials.from_service_account_info(creds_dict)
             return firestore.Client(credentials=creds)
     except Exception as e:
-        st.error(f"資料庫配置錯誤: {e}")
         return None
     return None
 
@@ -30,17 +30,15 @@ db = init_db_connection()
 # 取得 App ID
 app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v2")
 
-# --- 雲端數據存取 (修正路徑以符合 Rule 1) ---
+# --- 雲端數據存取 (遵循 Rule 1) ---
 def cloud_save(uid, portfolio):
     if not db: return
     try:
-        # 正確路徑規則: /artifacts/{appId}/users/{userId}/{collectionName}
-        # 這裡將 'portfolio' 作為集合名稱，'data' 作為唯一的文檔
+        # 路徑規則: /artifacts/{appId}/users/{userId}/{collectionName}/data
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
         doc_ref.set({"items": portfolio, "last_updated": datetime.now()})
     except Exception as e:
-        st.error(f"雲端寫入失敗 (權限拒絕): {e}")
-        st.info("請確認您的 Firebase 安全規則是否允許寫入該路徑。")
+        st.error(f"雲端存檔異常: {e}")
 
 def cloud_load(uid):
     if not db: return []
@@ -51,7 +49,7 @@ def cloud_load(uid):
     except Exception:
         return []
 
-# --- 核心跳檔級距 ---
+# --- 核心跳檔級距 (Tick Size) ---
 def get_tick(p):
     if p < 10: return 0.01
     elif p < 50: return 0.05
@@ -103,7 +101,7 @@ def find_stock(query):
     except: pass
     return None, None
 
-# --- 主介面與導覽 ---
+# --- 主介面導覽 ---
 st.sidebar.title("🎮 AI 實戰導航")
 mode = st.sidebar.radio("功能切換：", ["📢 AI 盤前推薦", "🛡️ 雲端持倉管理"])
 user_cloud_id = st.sidebar.text_input("🔑 雲端通行碼 (Cloud ID)", value="My_Portfolio_V1")
@@ -122,7 +120,7 @@ if mode == "📢 AI 盤前推薦":
     with st.spinner("AI 全面掃描市場數據中..."):
         for sid in scan_targets:
             try:
-                ticker = yf.Ticker(f"{sid}.TW")
+                ticker = yf.Ticker(Sid if ".TW" in sid else f"{sid}.TW")
                 df = compute_indicators(ticker.history(period="60d"))
                 if df.empty: continue
                 last, prev = df.iloc[-1], df.iloc[-2]
@@ -157,17 +155,20 @@ if mode == "📢 AI 盤前推薦":
 else:
     st.markdown("<h2 style='text-align: center; font-size: 22px;'>🛡️ 雲端持倉實戰診斷</h2>", unsafe_allow_html=True)
     
+    # 初始化或同步資料
     if 'portfolio_list' not in st.session_state or st.sidebar.button("🔄 同步資料庫"):
         st.session_state.portfolio_list = cloud_load(user_cloud_id)
 
-    with st.expander("➕ 新增個人持倉", expanded=False):
+    with st.expander("➕ 新增個人持倉標的", expanded=False):
         c1, c2, c3 = st.columns([2, 2, 1])
-        new_sid = c1.text_input("代號或名稱", key="add_sid_input")
-        new_cost = c2.number_input("平均成本", min_value=0.0, step=0.1, key="add_cost_input")
-        if c3.button("存入", key="save_btn"):
-            sym, name = find_stock(new_sid)
+        new_sid_input = c1.text_input("代號或名稱", key="add_sid_input")
+        new_cost_input = c2.number_input("平均買進成本", min_value=0.0, step=0.1, key="add_cost_input")
+        if c3.button("存入雲端", key="save_btn"):
+            sym, name = find_stock(new_sid_input)
             if sym:
-                st.session_state.portfolio_list.append({"symbol": sym, "name": name, "cost": new_cost})
+                # 建立新資料項，並加上時間戳記作為唯一辨識
+                new_item = {"symbol": sym, "name": name, "cost": new_cost_input, "timestamp": time.time()}
+                st.session_state.portfolio_list.append(new_item)
                 cloud_save(user_cloud_id, st.session_state.portfolio_list)
                 st.success(f"同步成功 {name}")
                 st.rerun()
@@ -177,11 +178,17 @@ else:
     if not st.session_state.portfolio_list:
         st.info(f"通行碼「{user_cloud_id}」目前無雲端紀錄。")
     else:
-        st.write(f"### 📍 即時雲端診斷 (ID: {user_cloud_id})")
-        for i, stock in enumerate(st.session_state.portfolio_list):
+        st.write(f"### 📍 即時雲端診斷清單")
+        
+        # 為了避免在迴圈中修改清單導致錯誤，我們建立一個待刪除的標記
+        to_delete_timestamp = None
+        
+        for stock in st.session_state.portfolio_list:
             try:
+                # 顯示資訊卡片
                 ticker = yf.Ticker(stock['symbol'])
                 df = compute_indicators(ticker.history(period="60d"))
+                if df.empty: continue
                 last = df.iloc[-1]
                 curr_p = round(last['Close'], 2)
                 profit = ((curr_p - stock['cost']) / stock['cost']) * 100
@@ -197,10 +204,11 @@ else:
                     if last['MACD'] > 0 or (last['K'] > last['D'] and last['K'] < 30):
                         d_status, d_action, d_color = "💪 底部轉強", "虧損但技術面現轉機，建議續抱等待解套。", "#58a6ff"
                     elif curr_p < last['MA20']:
-                        d_status, d_action, d_color = "🚨 趨勢走壞", "跌破關鍵均線。為了資金安全，建議果斷止損。", "#f85149"
+                        d_status, d_action, d_color = "🚨 趨勢破位", "跌破關鍵均線。為了資金安全，建議果斷止損。", "#f85149"
                     else:
                         d_status, d_action, d_color = "💤 盤整待變", "盤整區域。只要不破今日低點可觀望。", "#8b949e"
 
+                # 渲染卡片
                 st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border-left:8px solid {d_color}; margin-bottom:12px;">
                     <div style="display:flex; justify-content:space-between;"><b>{stock['name']}</b><b style="color:{d_color};">{d_status}</b></div>
                     <div style="display:flex; justify-content:space-between; margin:10px 0;">
@@ -212,11 +220,22 @@ else:
                     </div>
                 </div>""", unsafe_allow_html=True)
                 
-                if st.button(f"🗑️ 移除 {stock['name']}", key=f"del_{i}"):
-                    st.session_state.portfolio_list.pop(i)
-                    cloud_save(user_cloud_id, st.session_state.portfolio_list)
-                    st.rerun()
-            except: continue
+                # 刪除按鈕：使用 timestamp 作為 key 確保唯一性
+                if st.button(f"🗑️ 移除 {stock['name']} 紀錄", key=f"del_{stock.get('timestamp', stock['symbol'])}"):
+                    to_delete_timestamp = stock.get('timestamp')
+                    
+            except Exception as e:
+                st.error(f"解析 {stock['name']} 失敗: {e}")
+
+        # 執行刪除邏輯
+        if to_delete_timestamp is not None:
+            # 過濾掉該項目
+            st.session_state.portfolio_list = [s for s in st.session_state.portfolio_list if s.get('timestamp') != to_delete_timestamp]
+            # 同步回雲端
+            cloud_save(user_cloud_id, st.session_state.portfolio_list)
+            st.toast("✅ 紀錄已成功從雲端移除")
+            time.sleep(0.5)
+            st.rerun()
 
 # 底部狀態
 st.write("---")
@@ -224,5 +243,4 @@ if db:
     st.success("🟢 雲端資料庫已連線 (Firestore Ready)")
 else:
     st.warning("🔴 雲端未連線：請依照教學修正 Secrets 格式")
-st.caption(f"數據時間：{datetime.now().strftime('%H:%M:%S')} (延遲 15 分鐘)")
-
+st.caption(f"數據時間：{datetime.now().strftime('%H:%M:%S')} (Yahoo 延遲報價)")
