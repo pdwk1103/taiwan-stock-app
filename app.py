@@ -4,57 +4,109 @@ import pandas as pd
 import requests
 from datetime import datetime
 
-st.set_page_config(page_title="系統連線診斷", layout="centered")
+# --- 基本頁面配置 ---
+st.set_page_config(page_title="台股 AI 實戰系統", layout="centered")
 
-st.title("🔍 系統連線與數據診斷")
-
-# 1. 環境診斷
-st.subheader("1. 環境狀態")
-st.write(f"目前時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# 2. Yahoo Finance 壓力測試
-st.subheader("2. Yahoo 數據測試 (免金鑰)")
-target_stock = "2449.TW" # 京元電子
-
-try:
-    with st.spinner(f"嘗試抓取 {target_stock} ..."):
-        ticker = yf.Ticker(target_stock)
-        # 獲取最近一天的數據
-        df = ticker.history(period="1d")
-        
-        if not df.empty:
-            curr_price = df['Close'].iloc[-1]
-            st.success(f"✅ Yahoo 連線成功！{target_stock} 目前價格: {curr_price}")
-            
-            # 顯示簡單計算
-            st.metric("京元電子價格", f"{curr_price}")
-            st.info("如果看到這個，代表你的 App 基礎環境是正常的！")
-        else:
-            st.error("❌ Yahoo 回傳空數據。")
-            st.write("這通常是 Yahoo 暫時封鎖了 Cloud 伺服器的請求。")
-            
-except Exception as e:
-    st.error(f"❌ Yahoo 連線崩潰: {str(e)}")
-    st.write("這代表 yfinance 程式庫在目前環境下無法運行。")
-
-# 3. 富果連線壓力測試 (用你最新的金鑰)
-st.subheader("3. 富果 API 測試 (需金鑰)")
+# --- 金鑰設定 (這是您最新提供的 4f1b 序號) ---
 FUGLE_KEY = "4f1b5371-6a2d-4253-8eb0-373e0858f210"
 
-if st.button("點擊執行富果連線測試"):
-    url = f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/2449"
-    headers = {"X-API-KEY": FUGLE_KEY}
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            st.success("✅ 富果 API 連線成功！")
-            st.json(res.json())
-        else:
-            st.error(f"❌ 富果連線失敗代碼: {res.status_code}")
-            st.write(f"伺服器訊息: {res.text}")
-    except Exception as e:
-        st.error(f"❌ 富果請求崩潰: {str(e)}")
+# --- 側邊欄設定 ---
+st.sidebar.title("🛠️ 交易參數設定")
+discount = st.sidebar.slider("券商手續費折扣", 0.1, 1.0, 0.6)
+st.sidebar.markdown("---")
+st.sidebar.info("系統會優先嘗試 Fugle 實時數據，若失敗將自動切換至 Yahoo 延遲數據。")
 
-st.divider()
-st.caption("診斷完成後，請將看到的錯誤訊息截圖告訴我。")
+# --- 數據獲取引擎 ---
+
+def get_yahoo_data(symbol):
+    """Yahoo Finance 備援引擎 (免金鑰)"""
+    try:
+        ticker = yf.Ticker(f"{symbol}.TW")
+        df = ticker.history(period="1d")
+        if not df.empty:
+            last_p = df['Close'].iloc[-1]
+            prev_p = ticker.info.get('regularMarketPreviousClose', last_p)
+            change = ((last_p - prev_p) / prev_p) * 100
+            return {
+                "source": "Yahoo (延遲15分)",
+                "price": round(last_p, 2),
+                "change": round(change, 2),
+                "vol": int(df['Volume'].iloc[-1])
+            }
+    except:
+        return None
+
+def get_fugle_data(symbol):
+    """富果實時引擎 (需金鑰)"""
+    # 嘗試兩種常見的 API URL 格式
+    for url in [
+        f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/{symbol}",
+        f"https://api.fugle.tw/marketdata/v1.0/stock/snapshot/{symbol}.TW"
+    ]:
+        try:
+            res = requests.get(url, headers={"X-API-KEY": FUGLE_KEY}, timeout=5)
+            if res.status_code == 200:
+                d = res.json()
+                return {
+                    "source": "Fugle (實時數據)",
+                    "price": d.get('lastPrice'),
+                    "change": d.get('changePercent'),
+                    "vol": d.get('totalVolume')
+                }
+        except:
+            continue
+    return None
+
+# --- App 主介面 ---
+st.title("🚀 台股 AI 全方位決策")
+
+# 1. 標的選取
+stocks = {"2449": "京元電子", "2330": "台積電", "2317": "鴻海", "2303": "聯電", "3711": "日月光"}
+sid = st.selectbox("監控標的", list(stocks.keys()), format_func=lambda x: f"{x} {stocks[x]}")
+
+# 2. 數據抓取邏輯 (優先 Fugle, 備援 Yahoo)
+with st.spinner("數據同步中..."):
+    final_data = get_fugle_data(sid)
+    if not final_data:
+        final_data = get_yahoo_data(sid)
+
+# 3. 介面呈現
+if final_data:
+    p = final_data['price']
+    
+    # 頂部狀態列
+    st.markdown(f"📡 數據源：`{final_data['source']}`")
+    
+    col1, col2 = st.columns(2)
+    col1.metric("目前成交價", f"{p}", f"{final_data['change']}%")
+    col2.metric("總量", f"{final_data['vol']:,}")
+
+    st.divider()
+
+    # 4. AI 決策模型 (6 折成本計算)
+    # 損平公式：價格 * (1 + 買賣手續費率*折扣 + 當沖稅 0.15%)
+    # 註：0.001425*2*discount + 0.0015
+    cost_rate = (0.001425 * discount * 2) + 0.0015
+    be_price = p * (1 + cost_rate)
+    tick = 0.5 if p >= 100 else 0.1
+    
+    st.success(f"🤖 AI 決策建議：當沖損平點 **{be_price:.2f}**")
+    
+    # 5. 操作點位參考
+    t1, t2, t3 = st.columns(3)
+    t1.error(f"停損\n{p - tick*3:.1f}")
+    t2.warning(f"進場\n{p - tick:.1f}")
+    t3.success(f"停利\n{p + tick*4:.1f}")
+
+    if st.button("🔄 手動刷新行情"):
+        st.rerun()
+
+    # 如果使用的是 Yahoo 備援，底部顯示警告
+    if "Yahoo" in final_data['source']:
+        st.warning("⚠️ 富果 API 目前無法連線 (可能是 Key 權限未開通)，暫時使用 Yahoo 延遲數據。")
+
+else:
+    st.error("❌ 所有數據源連線失敗，請檢查網路設定。")
+
+st.caption(f"系統時間：{datetime.now().strftime('%H:%M:%S')}")
 
