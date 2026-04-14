@@ -204,4 +204,4 @@ if st.button("🔄 手動刷新市場診斷"):
     st.rerun()
 
 st.caption(f"數據時點：{datetime.now().strftime('%H:%M:%S')} (延遲 15 分鐘)")
-.
+
