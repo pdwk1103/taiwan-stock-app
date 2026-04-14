@@ -2,54 +2,59 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
-import json
 import time
 from datetime import datetime
 from google.cloud import firestore
 from google.oauth2 import service_account
 
-# --- 頁面配置 ---
+# --- 頁面配置 (針對 iPhone 寬度優化) ---
 st.set_page_config(page_title="台股 AI 雲端實戰", layout="centered", initial_sidebar_state="collapsed")
 
-# --- Firebase / Firestore 初始化 ---
+# --- 1. Firebase / Firestore 初始化 ---
 @st.cache_resource
-def init_db_connection():
-    """初始化雲端資料庫連線"""
+def init_db():
     try:
         if "firebase" in st.secrets:
             creds_dict = dict(st.secrets["firebase"])
-            # 確保私鑰換行符號正確
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = service_account.Credentials.from_service_account_info(creds_dict)
             return firestore.Client(credentials=creds)
-    except Exception as e:
+    except:
         return None
     return None
 
-db = init_db_connection()
-# 取得 App ID
+db = init_db()
 app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v2")
 
-# --- 雲端數據存取 (遵循 Rule 1) ---
-def cloud_save(uid, portfolio):
+# --- 2. 雲端核心同步邏輯 (修正儲存與讀取問題) ---
+def cloud_save_data(uid, data_list):
     if not db: return
     try:
-        # 路徑規則: /artifacts/{appId}/users/{userId}/{collectionName}/data
+        # 路徑：/artifacts/{appId}/users/{userId}/portfolio/data
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
-        doc_ref.set({"items": portfolio, "last_updated": datetime.now()})
+        doc_ref.set({"items": data_list, "updated": datetime.now()})
     except Exception as e:
-        st.error(f"雲端存檔異常: {e}")
+        st.error(f"雲端寫入異常: {e}")
 
-def cloud_load(uid):
+def cloud_load_data(uid):
     if not db: return []
     try:
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
         doc = doc_ref.get()
         return doc.to_dict().get("items", []) if doc.exists else []
-    except Exception:
+    except:
         return []
 
-# --- 核心跳檔級距 (Tick Size) ---
+# --- 3. 初始化或偵測 ID 變更 ---
+# 這是修復「關掉重開後資料不見」的關鍵
+def sync_portfolio_state(uid):
+    # 如果用戶換了 ID，或者還沒載入過資料
+    if 'current_cloud_id' not in st.session_state or st.session_state.current_cloud_id != uid:
+        st.session_state.current_cloud_id = uid
+        with st.spinner(f"正在同步 {uid} 的雲端庫存..."):
+            st.session_state.portfolio_list = cloud_load_data(uid)
+
+# --- 4. 技術指標與行情工具 ---
 def get_tick(p):
     if p < 10: return 0.01
     elif p < 50: return 0.05
@@ -58,189 +63,131 @@ def get_tick(p):
     elif p < 1000: return 1.0
     else: return 5.0
 
-# --- 技術指標計算 ---
-def compute_indicators(df):
+def compute_tech(df):
     if len(df) < 35: return df
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    # KD
-    low_min = df['Low'].rolling(window=9).min()
-    high_max = df['High'].rolling(window=9).max()
-    df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
+    low_9 = df['Low'].rolling(window=9).min()
+    high_9 = df['High'].rolling(window=9).max()
+    df['RSV'] = (df['Close'] - low_9) / (high_9 - low_9) * 100
     df['K'] = df['RSV'].ewm(com=2).mean()
     df['D'] = df['K'].ewm(com=2).mean()
-    # MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = exp1 - exp2
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = (df['DIF'] - df['DEA']) * 2
+    df['MACD'] = (exp1 - exp2 - (exp1 - exp2).ewm(span=9, adjust=False).mean()) * 2
     return df
 
-# --- 市場搜尋與 ADR 分析 ---
 @st.cache_data(ttl=3600)
-def get_adr_sentiment():
+def get_adr():
     try:
         tsm = yf.Ticker("TSM").history(period="2d")
-        adr_change = ((tsm['Close'].iloc[-1] - tsm['Close'].iloc[-2]) / tsm['Close'].iloc[-2]) * 100
-        return round(adr_change, 2)
+        return round(((tsm['Close'].iloc[-1] - tsm['Close'].iloc[-2]) / tsm['Close'].iloc[-2]) * 100, 2)
     except: return 0.0
 
-def find_stock(query):
-    query = query.strip()
-    if not query: return None, None
-    if query.isdigit() and len(query) >= 4: return f"{query}.TW", query
+def find_stock(q):
+    q = q.strip()
+    if q.isdigit() and len(q) >= 4: return f"{q}.TW", q
     try:
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&lang=zh-Hant-TW&region=TW"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-        if res.status_code == 200:
-            qs = res.json().get('quotes', [])
-            for q in qs:
-                s = q.get('symbol', '')
-                if ".TW" in s or ".TWO" in s: return s, q.get('shortname', s)
+        res = requests.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={q}&lang=zh-Hant-TW&region=TW", headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        for quote in res.json().get('quotes', []):
+            s = quote.get('symbol', '')
+            if ".TW" in s or ".TWO" in s: return s, quote.get('shortname', s)
     except: pass
     return None, None
 
-# --- 主介面導覽 ---
-st.sidebar.title("🎮 AI 實戰導航")
-mode = st.sidebar.radio("功能切換：", ["📢 AI 盤前推薦", "🛡️ 雲端持倉管理"])
-user_cloud_id = st.sidebar.text_input("🔑 雲端通行碼 (Cloud ID)", value="My_Portfolio_V1")
+# --- 5. 主介面 ---
+st.sidebar.title("🎮 AI 實戰控制台")
+mode = st.sidebar.radio("切換模式", ["📢 AI 盤前推薦", "🛡️ 雲端持倉管理"])
+user_id = st.sidebar.text_input("🔑 雲端通行碼", value="User_Default")
 discount = st.sidebar.slider("券商手續費折扣", 0.1, 1.0, 0.6)
 
-adr_val = get_adr_sentiment()
+# 強制同步雲端資料
+sync_portfolio_state(user_id)
+adr_val = get_adr()
 
-# --- 模式一：盤前推薦 ---
+# --- 模式一：推薦 ---
 if mode == "📢 AI 盤前推薦":
-    st.markdown("<h2 style='text-align: center; font-size: 22px;'>🚀 今日 AI 盤前選股推薦</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center; font-size: 22px;'>🚀 今日 AI 選股推薦</h2>", unsafe_allow_html=True)
     st.markdown(f"""<div style="background-color:#1e2329; padding:10px; border-radius:10px; text-align:center; margin-bottom:15px; border-left:5px solid {'#3fb950' if adr_val > 0 else '#f85149'};"><span style="color:#888; font-size:12px;">前夜美股連動 (TSM ADR)</span><br><b style="color:{'#3fb950' if adr_val > 0 else '#f85149'}; font-size:18px;">{adr_val:+.2f}%</b></div>""", unsafe_allow_html=True)
 
-    scan_targets = ["2449", "2330", "2317", "2603", "2618", "2382", "2454", "3008", "2609", "2303"]
+    scan_list = ["2449", "2330", "2317", "2603", "2618", "2382", "2454", "3008"]
     recs = []
-    
-    with st.spinner("AI 全面掃描市場數據中..."):
-        for sid in scan_targets:
+    with st.spinner("掃描技術面指標中..."):
+        for sid in scan_list:
             try:
-                ticker = yf.Ticker(Sid if ".TW" in sid else f"{sid}.TW")
-                df = compute_indicators(ticker.history(period="60d"))
-                if df.empty: continue
+                ticker = yf.Ticker(f"{sid}.TW")
+                df = compute_tech(ticker.history(period="60d"))
                 last, prev = df.iloc[-1], df.iloc[-2]
-                
-                score = 50
+                score = 50 + (adr_val * 2)
                 if last['Close'] > last['MA5']: score += 15
                 if last['K'] > last['D'] and prev['K'] <= prev['D']: score += 15
                 if last['MACD'] > 0: score += 10
-                score += (adr_val * 2.5)
-                
                 if score >= 60:
-                    tick = get_tick(last['Close'])
-                    recs.append({
-                        "id": sid, "name": ticker.info.get('shortName', sid),
-                        "price": round(last['Close'], 2), "score": int(score),
-                        "buy": round(max(last['MA5'], last['Close'] - tick), 2),
-                        "target": round(last['Close'] + tick * 8, 2)
-                    })
+                    tk = get_tick(last['Close'])
+                    recs.append({"id": sid, "name": ticker.info.get('shortName', sid), "price": round(last['Close'], 2), "score": int(score), "buy": round(max(last['MA5'], last['Close'] - tk), 2), "target": round(last['Close'] + tk * 8, 2)})
             except: continue
 
     for item in sorted(recs, key=lambda x: x['score'], reverse=True):
-        st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border:1px solid #30363d; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between;"><b>{item['name']} ({item['id']})</b><span style="color:#3fb950;">評分: {item['score']}</span></div>
-            <div style="display:flex; justify-content:space-between; margin-top:8px; background:#0d1117; padding:10px; border-radius:8px;">
-                <div style="text-align:center;"><small style="color:#888;">建議買進</small><br><b style="color:#3fb950;">{item['buy']}</b></div>
-                <div style="text-align:center;"><small style="color:#888;">目標獲利</small><br><b style="color:#58a6ff;">{item['target']}</b></div>
-                <div style="text-align:center;"><small style="color:#888;">目前參考</small><br><b>{item['price']}</b></div>
-            </div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border:1px solid #30363d; margin-bottom:12px;"><div style="display:flex; justify-content:space-between;"><b>{item['name']} ({item['id']})</b><span style="color:#3fb950;">評分: {item['score']}</span></div><div style="display:flex; justify-content:space-between; margin-top:8px; background:#0d1117; padding:10px; border-radius:8px;"><div style="text-align:center;"><small style="color:#888;">買進參考</small><br><b style="color:#3fb950;">{item['buy']}</b></div><div style="text-align:center;"><small style="color:#888;">目標獲利</small><br><b style="color:#58a6ff;">{item['target']}</b></div><div style="text-align:center;"><small style="color:#888;">目前</small><br><b>{item['price']}</b></div></div></div>""", unsafe_allow_html=True)
 
-# --- 模式二：雲端持倉管理 ---
+# --- 模式二：雲端持倉 ---
 else:
     st.markdown("<h2 style='text-align: center; font-size: 22px;'>🛡️ 雲端持倉實戰診斷</h2>", unsafe_allow_html=True)
     
-    # 初始化或同步資料
-    if 'portfolio_list' not in st.session_state or st.sidebar.button("🔄 同步資料庫"):
-        st.session_state.portfolio_list = cloud_load(user_cloud_id)
-
-    with st.expander("➕ 新增個人持倉標的", expanded=False):
+    with st.expander("➕ 新增持倉標的", expanded=False):
         c1, c2, c3 = st.columns([2, 2, 1])
-        new_sid_input = c1.text_input("代號或名稱", key="add_sid_input")
-        new_cost_input = c2.number_input("平均買進成本", min_value=0.0, step=0.1, key="add_cost_input")
-        if c3.button("存入雲端", key="save_btn"):
-            sym, name = find_stock(new_sid_input)
+        new_sid = c1.text_input("代號或名稱")
+        new_cost = c2.number_input("平均成本", min_value=0.0, step=0.1)
+        if c3.button("存入雲端", use_container_width=True):
+            sym, name = find_stock(new_sid)
             if sym:
-                # 建立新資料項，並加上時間戳記作為唯一辨識
-                new_item = {"symbol": sym, "name": name, "cost": new_cost_input, "timestamp": time.time()}
-                st.session_state.portfolio_list.append(new_item)
-                cloud_save(user_cloud_id, st.session_state.portfolio_list)
-                st.success(f"同步成功 {name}")
+                # 確保帶入 timestamp 方便後續精準刪除
+                st.session_state.portfolio_list.append({"symbol": sym, "name": name, "cost": new_cost, "ts": time.time()})
+                cloud_save_data(user_id, st.session_state.portfolio_list)
+                st.success(f"已儲存至雲端: {name}")
                 st.rerun()
-            else:
-                st.error("查無此標的")
+            else: st.error("查無此標的")
 
     if not st.session_state.portfolio_list:
-        st.info(f"通行碼「{user_cloud_id}」目前無雲端紀錄。")
+        st.info(f"ID: 「{user_id}」目前雲端無紀錄。")
     else:
-        st.write(f"### 📍 即時雲端診斷清單")
-        
-        # 為了避免在迴圈中修改清單導致錯誤，我們建立一個待刪除的標記
-        to_delete_timestamp = None
+        # 修復刪除閃退的關鍵：使用暫存變數記錄待刪除項
+        delete_target_ts = None
         
         for stock in st.session_state.portfolio_list:
             try:
-                # 顯示資訊卡片
                 ticker = yf.Ticker(stock['symbol'])
-                df = compute_indicators(ticker.history(period="60d"))
-                if df.empty: continue
+                df = compute_tech(ticker.history(period="60d"))
                 last = df.iloc[-1]
                 curr_p = round(last['Close'], 2)
                 profit = ((curr_p - stock['cost']) / stock['cost']) * 100
                 tk = get_tick(curr_p)
                 
-                d_status, d_action, d_color = "", "", "#ffffff"
+                status, action, color = "", "", "#ffffff"
                 if profit > 0:
-                    if last['MACD'] > 0 and last['K'] > last['D']:
-                        d_status, d_action, d_color = "🚀 強勢續強", f"指標多頭。建議續留。目標上看 {curr_p + tk*10}", "#3fb950"
-                    else:
-                        d_status, d_action, d_color = "⚠️ 漲勢轉弱", "指標轉折。建議分批減碼獲利了結。", "#f0883e"
+                    if last['MACD'] > 0 and last['K'] > last['D']: status, action, color = "🚀 強勢續強", "建議續留，讓獲利奔跑。目標 " + str(curr_p + tk*10), "#3fb950"
+                    else: status, action, color = "⚠️ 漲勢轉弱", "指標轉折，建議分批減碼獲利入袋。", "#f0883e"
                 else:
-                    if last['MACD'] > 0 or (last['K'] > last['D'] and last['K'] < 30):
-                        d_status, d_action, d_color = "💪 底部轉強", "虧損但技術面現轉機，建議續抱等待解套。", "#58a6ff"
-                    elif curr_p < last['MA20']:
-                        d_status, d_action, d_color = "🚨 趨勢破位", "跌破關鍵均線。為了資金安全，建議果斷止損。", "#f85149"
-                    else:
-                        d_status, d_action, d_color = "💤 盤整待變", "盤整區域。只要不破今日低點可觀望。", "#8b949e"
+                    if last['MACD'] > 0 or (last['K'] > last['D'] and last['K'] < 30): status, action, color = "💪 低檔轉強", "虧損中但指標轉強，建議續抱等待解套。", "#58a6ff"
+                    elif curr_p < last['MA20']: status, action, color = "🚨 趨勢破位", "跌破關鍵支撐，建議果斷止損。", "#f85149"
+                    else: status, action, color = "💤 盤整待變", "盤整中，守住低點可暫留。", "#8b949e"
 
-                # 渲染卡片
-                st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border-left:8px solid {d_color}; margin-bottom:12px;">
-                    <div style="display:flex; justify-content:space-between;"><b>{stock['name']}</b><b style="color:{d_color};">{d_status}</b></div>
-                    <div style="display:flex; justify-content:space-between; margin:10px 0;">
-                        <span>成本: {stock['cost']} | 現價: <b>{curr_p}</b></span>
-                        <span style="color:{d_color}; font-size:18px;">{profit:+.2f}%</span>
-                    </div>
-                    <div style="background:#0d1117; padding:10px; border-radius:8px; font-size:14px; border:1px solid #30363d;">
-                        <b>💡 AI 建議：</b>{d_action}
-                    </div>
-                </div>""", unsafe_allow_html=True)
+                st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border-left:8px solid {color}; margin-bottom:12px;"><div style="display:flex; justify-content:space-between;"><b>{stock['name']}</b><b style="color:{color};">{status}</b></div><div style="display:flex; justify-content:space-between; margin:10px 0;"><span>成本: {stock['cost']} | 現價: <b>{curr_p}</b></span><span style="color:{color}; font-size:18px;">{profit:+.2f}%</span></div><div style="background:#0d1117; padding:10px; border-radius:8px; font-size:13px; border:1px solid #30363d;"><b>AI 指導：</b>{action}</div></div>""", unsafe_allow_html=True)
                 
-                # 刪除按鈕：使用 timestamp 作為 key 確保唯一性
-                if st.button(f"🗑️ 移除 {stock['name']} 紀錄", key=f"del_{stock.get('timestamp', stock['symbol'])}"):
-                    to_delete_timestamp = stock.get('timestamp')
-                    
-            except Exception as e:
-                st.error(f"解析 {stock['name']} 失敗: {e}")
+                if st.button(f"🗑️ 移除 {stock['name']}", key=f"del_{stock.get('ts', stock['symbol'])}"):
+                    delete_target_ts = stock.get('ts')
+            except: continue
 
-        # 執行刪除邏輯
-        if to_delete_timestamp is not None:
-            # 過濾掉該項目
-            st.session_state.portfolio_list = [s for s in st.session_state.portfolio_list if s.get('timestamp') != to_delete_timestamp]
-            # 同步回雲端
-            cloud_save(user_cloud_id, st.session_state.portfolio_list)
-            st.toast("✅ 紀錄已成功從雲端移除")
+        # 處理刪除邏輯
+        if delete_target_ts:
+            st.session_state.portfolio_list = [s for s in st.session_state.portfolio_list if s.get('ts') != delete_target_ts]
+            cloud_save_data(user_id, st.session_state.portfolio_list)
+            st.toast("✅ 雲端資料已移除")
             time.sleep(0.5)
             st.rerun()
 
-# 底部狀態
 st.write("---")
-if db:
-    st.success("🟢 雲端資料庫已連線 (Firestore Ready)")
-else:
-    st.warning("🔴 雲端未連線：請依照教學修正 Secrets 格式")
-st.caption(f"數據時間：{datetime.now().strftime('%H:%M:%S')} (Yahoo 延遲報價)")
+if db: st.success("🟢 雲端同步中 (ID: " + user_id + ")")
+else: st.warning("🔴 雲端未連線 (請檢查 Secrets)")
+st.caption(f"更新時間：{datetime.now().strftime('%H:%M:%S')}")
+
