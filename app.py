@@ -16,6 +16,7 @@ def init_db():
     try:
         if "firebase" in st.secrets:
             creds_dict = dict(st.secrets["firebase"])
+            # 確保私鑰換行符號正確
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = service_account.Credentials.from_service_account_info(creds_dict)
             return firestore.Client(credentials=creds)
@@ -26,18 +27,17 @@ def init_db():
 db = init_db()
 app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v2")
 
-# --- 2. 雲端核心同步邏輯 (修正儲存與讀取問題) ---
+# --- 2. 雲端核心同步邏輯 ---
 def cloud_save_data(uid, data_list):
-    if not db: return
+    if not db or not uid: return
     try:
-        # 路徑：/artifacts/{appId}/users/{userId}/portfolio/data
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
         doc_ref.set({"items": data_list, "updated": datetime.now()})
     except Exception as e:
         st.error(f"雲端寫入異常: {e}")
 
 def cloud_load_data(uid):
-    if not db: return []
+    if not db or not uid: return []
     try:
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
         doc = doc_ref.get()
@@ -46,12 +46,14 @@ def cloud_load_data(uid):
         return []
 
 # --- 3. 初始化或偵測 ID 變更 ---
-# 這是修復「關掉重開後資料不見」的關鍵
 def sync_portfolio_state(uid):
+    if not uid:
+        st.session_state.portfolio_list = []
+        return
     # 如果用戶換了 ID，或者還沒載入過資料
     if 'current_cloud_id' not in st.session_state or st.session_state.current_cloud_id != uid:
         st.session_state.current_cloud_id = uid
-        with st.spinner(f"正在同步 {uid} 的雲端庫存..."):
+        with st.spinner(f"正在連線至雲端空間..."):
             st.session_state.portfolio_list = cloud_load_data(uid)
 
 # --- 4. 技術指標與行情工具 ---
@@ -98,19 +100,30 @@ def find_stock(q):
 # --- 5. 主介面 ---
 st.sidebar.title("🎮 AI 實戰控制台")
 mode = st.sidebar.radio("切換模式", ["📢 AI 盤前推薦", "🛡️ 雲端持倉管理"])
-user_id = st.sidebar.text_input("🔑 雲端通行碼", value="User_Default")
+user_id = st.sidebar.text_input("🔑 雲端通行碼", value="", placeholder="請輸入您的個人帳號代碼")
 discount = st.sidebar.slider("券商手續費折扣", 0.1, 1.0, 0.6)
 
-# 強制同步雲端資料
+# 同步雲端資料 (若無 ID 則不動作)
 sync_portfolio_state(user_id)
 adr_val = get_adr()
+
+# 如果通行碼為空，強制顯示引導畫面
+if not user_id:
+    st.markdown("""
+    <div style="text-align: center; padding: 50px 20px;">
+        <h1 style="font-size: 60px;">🗝️</h1>
+        <h2>請先輸入雲端通行碼</h2>
+        <p style="color: #888;">請在左側選單中設定您的個人通行碼（個人帳號），<br>設定後即可開始同步雲端選股與持倉診斷。</p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
 # --- 模式一：推薦 ---
 if mode == "📢 AI 盤前推薦":
     st.markdown("<h2 style='text-align: center; font-size: 22px;'>🚀 今日 AI 選股推薦</h2>", unsafe_allow_html=True)
     st.markdown(f"""<div style="background-color:#1e2329; padding:10px; border-radius:10px; text-align:center; margin-bottom:15px; border-left:5px solid {'#3fb950' if adr_val > 0 else '#f85149'};"><span style="color:#888; font-size:12px;">前夜美股連動 (TSM ADR)</span><br><b style="color:{'#3fb950' if adr_val > 0 else '#f85149'}; font-size:18px;">{adr_val:+.2f}%</b></div>""", unsafe_allow_html=True)
 
-    scan_list = ["2449", "2330", "2317", "2603", "2618", "2382", "2454", "3008"]
+    scan_list = ["2449", "2330", "2317", "2603", "2618", "2382", "2454", "3008", "2609", "3231", "2303"]
     recs = []
     with st.spinner("掃描技術面指標中..."):
         for sid in scan_list:
@@ -136,22 +149,25 @@ else:
     
     with st.expander("➕ 新增持倉標的", expanded=False):
         c1, c2, c3 = st.columns([2, 2, 1])
-        new_sid = c1.text_input("代號或名稱")
-        new_cost = c2.number_input("平均成本", min_value=0.0, step=0.1)
+        new_sid = c1.text_input("代號或名稱", placeholder="2449")
+        # 這裡改為 value=None，讓輸入框預設為空
+        new_cost = c2.number_input("買進成本", value=None, placeholder="請輸入單價", step=0.1)
+        
         if c3.button("存入雲端", use_container_width=True):
-            sym, name = find_stock(new_sid)
-            if sym:
-                # 確保帶入 timestamp 方便後續精準刪除
-                st.session_state.portfolio_list.append({"symbol": sym, "name": name, "cost": new_cost, "ts": time.time()})
-                cloud_save_data(user_id, st.session_state.portfolio_list)
-                st.success(f"已儲存至雲端: {name}")
-                st.rerun()
-            else: st.error("查無此標的")
+            if not new_cost:
+                st.error("請輸入買進成本")
+            else:
+                sym, name = find_stock(new_sid)
+                if sym:
+                    st.session_state.portfolio_list.append({"symbol": sym, "name": name, "cost": new_cost, "ts": time.time()})
+                    cloud_save_data(user_id, st.session_state.portfolio_list)
+                    st.success(f"已儲存至雲端: {name}")
+                    st.rerun()
+                else: st.error("查無此標的")
 
     if not st.session_state.portfolio_list:
         st.info(f"ID: 「{user_id}」目前雲端無紀錄。")
     else:
-        # 修復刪除閃退的關鍵：使用暫存變數記錄待刪除項
         delete_target_ts = None
         
         for stock in st.session_state.portfolio_list:
@@ -178,7 +194,6 @@ else:
                     delete_target_ts = stock.get('ts')
             except: continue
 
-        # 處理刪除邏輯
         if delete_target_ts:
             st.session_state.portfolio_list = [s for s in st.session_state.portfolio_list if s.get('ts') != delete_target_ts]
             cloud_save_data(user_id, st.session_state.portfolio_list)
@@ -187,7 +202,5 @@ else:
             st.rerun()
 
 st.write("---")
-if db: st.success("🟢 雲端同步中 (ID: " + user_id + ")")
-else: st.warning("🔴 雲端未連線 (請檢查 Secrets)")
+st.success(f"🟢 雲端同步中 (帳號: {user_id})")
 st.caption(f"更新時間：{datetime.now().strftime('%H:%M:%S')}")
-
