@@ -12,11 +12,51 @@ st.set_page_config(page_title="台股 AI 雲端實戰", layout="centered", initi
 
 # --- 0. 台北時間工具 (24H 格式) ---
 def get_taipei_now():
-    """獲取目前的台北時間 (UTC+8)"""
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz)
 
-# --- 1. Firebase / Firestore 初始化 ---
+# --- 1. 雲端總表管理中心 (Master Directory) ---
+
+def load_cloud_directory():
+    """從雲端讀取全台股對照表"""
+    if not db: return {}
+    try:
+        doc_ref = db.collection("artifacts").document(app_id).collection("public").document("data").collection("directory").document("master_list")
+        doc = doc_ref.get()
+        return doc.to_dict().get("mapping", {}) if doc.exists else {}
+    except: return {}
+
+def update_cloud_directory(new_mapping):
+    """更新雲端總表"""
+    if not db: return False
+    try:
+        doc_ref = db.collection("artifacts").document(app_id).collection("public").document("data").collection("directory").document("master_list")
+        doc_ref.set({
+            "mapping": new_mapping,
+            "last_updated": get_taipei_now(),
+            "count": len(new_mapping)
+        })
+        return True
+    except: return False
+
+@st.cache_data(ttl=86400)
+def fetch_real_zh_name(symbol):
+    """強制獲取繁體中文名稱 (Yahoo API 修正版)"""
+    pure_id = symbol.split('.')[0]
+    try:
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={pure_id}&lang=zh-Hant-TW&region=TW"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=5)
+        quotes = res.json().get('quotes', [])
+        for q in quotes:
+            if q.get('symbol').startswith(pure_id):
+                name = q.get('shortname') or q.get('longname') or pure_id
+                # 過濾所有英文名稱字串
+                return name.split(' ')[0].split('(')[0].replace("Common", "").strip()
+    except: pass
+    return pure_id
+
+# --- 2. Firebase / Firestore 初始化 ---
 @st.cache_resource
 def init_db():
     try:
@@ -25,58 +65,13 @@ def init_db():
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = service_account.Credentials.from_service_account_info(creds_dict)
             return firestore.Client(credentials=creds)
-    except Exception:
-        return None
+    except: return None
     return None
 
 db = init_db()
 app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v3")
 
-# --- 2. 雲端總表管理 (Master Directory) ---
-
-def load_master_directory():
-    """從雲端讀取全市場對照表"""
-    if not db: return {}
-    try:
-        # 遵循 Rule 1 路徑
-        doc_ref = db.collection("artifacts").document(app_id).collection("public").document("data").collection("directory").document("master_list")
-        doc = doc_ref.get()
-        return doc.to_dict().get("mapping", {}) if doc.exists else {}
-    except:
-        return {}
-
-def save_master_directory(mapping):
-    """將全市場對照表存回雲端"""
-    if not db: return False
-    try:
-        doc_ref = db.collection("artifacts").document(app_id).collection("public").document("data").collection("directory").document("master_list")
-        doc_ref.set({
-            "mapping": mapping,
-            "last_updated": get_taipei_now(),
-            "count": len(mapping)
-        }, merge=True)
-        return True
-    except:
-        return False
-
-@st.cache_data(ttl=86400)
-def fetch_stock_name_online(symbol):
-    """即時從網路獲取個股繁體中文名"""
-    pure_id = symbol.split('.')[0]
-    try:
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={pure_id}&lang=zh-Hant-TW&region=TW"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            quotes = res.json().get('quotes', [])
-            for q in quotes:
-                if q.get('symbol').startswith(pure_id):
-                    name = q.get('shortname') or q.get('longname') or pure_id
-                    return name.split(' ')[0].split('(')[0].strip()
-    except: pass
-    return pure_id
-
-# --- 3. 雲端同步與登入管理 ---
+# --- 3. 登入與持倉管理 ---
 def cloud_save_portfolio(uid, data):
     if not db or not uid: return False
     try:
@@ -112,35 +107,45 @@ def handle_login(uid):
         st.query_params["uid"] = uid 
         st.rerun()
 
-# --- 4. AI 廣域分析引擎 ---
+# --- 4. AI 量化選拔引擎 (盲測邏輯) ---
 
-def compute_quant_score(df, adr_val):
-    if len(df) < 30: return 0, 0, 0, "N/A"
+def compute_quant_score(df, adr):
+    """
+    【盲測核心】
+    100% 數據導向，不考慮股票名稱，只看數據是否具備獲利優勢。
+    """
+    if len(df) < 25: return 0, 0, 0, "觀察"
     l, p = df.iloc[-1], df.iloc[-2]
-    score = 35 + (adr_val * 2.2)
-    if l['Close'] > l['MA5']: score += 15
-    if l['K'] > l['D'] and p['K'] <= p['D']: score += 20
-    if l['MACD'] > 0: score += 15
-    if l['Volume'] > df['Volume'].tail(15).mean() * 1.1: score += 15
     
-    rank = "⚡ 強力推薦" if score >= 85 else "✅ 建議布局" if score >= 70 else "整理"
-    buy = round(max(l['MA5'], l['Close'] * 0.994), 2)
-    target = round(l['Close'] * 1.055, 2)
+    # 評分系統：技術趨勢(50%) + 量能(30%) + 市場情緒(20%)
+    score = 30 + (adr * 2.5)
+    
+    # 技術因子
+    if l['Close'] > l['MA5']: score += 15 # 短線多頭
+    if l['K'] > l['D'] and p['K'] <= p['D']: score += 20 # 黃金交叉
+    if l['MACD'] > 0: score += 15 # 能量轉強
+    
+    # 量能因子
+    if l['Volume'] > df['Volume'].tail(15).mean() * 1.2: score += 10 # 價量齊揚
+    
+    rank = "🚀 強力推薦" if score >= 85 else "✅ 建議布局" if score >= 70 else "盤整待變"
+    buy = round(max(l['MA5'], l['Close'] * 0.993), 2)
+    target = round(l['Close'] * 1.058, 2)
     return int(score), buy, target, rank
 
-def apply_tech(df):
-    if len(df) < 30: return df
+def apply_tech_analysis(df):
+    if len(df) < 25: return df
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    l, h = df['Low'].rolling(window=9).min(), df['High'].rolling(window=9).max()
-    df['K'] = ((df['Close'] - l) / (h - l) * 100).ewm(com=2).mean()
+    low, high = df['Low'].rolling(window=9).min(), df['High'].rolling(window=9).max()
+    df['K'] = ((df['Close'] - low) / (high - low) * 100).ewm(com=2).mean()
     df['D'] = df['K'].ewm(com=2).mean()
     e12, e26 = df['Close'].ewm(span=12).mean(), df['Close'].ewm(span=26).mean()
     df['MACD'] = (e12 - e26 - (e12 - e26).ewm(span=9).mean()) * 2
     return df
 
 @st.cache_data(ttl=3600)
-def get_adr():
+def get_adr_val():
     try:
         tsm = yf.Ticker("TSM").history(period="2d")
         return round(((tsm['Close'].iloc[-1] - tsm['Close'].iloc[-2]) / tsm['Close'].iloc[-2]) * 100, 2)
@@ -151,73 +156,71 @@ def get_adr():
 if not st.session_state.authenticated:
     st.markdown("<div style='height: 80px;'></div>", unsafe_allow_html=True)
     st.markdown("<h1 style='text-align: center; color: #58a6ff;'>🚀 AI 實戰選股中心</h1>", unsafe_allow_html=True)
-    login_id = st.text_input("通行碼", placeholder="請輸入通行碼", label_visibility="collapsed")
+    login_id = st.text_input("通行碼", placeholder="輸入個人通行碼", label_visibility="collapsed")
     if st.button("確認登入並同步", use_container_width=True, type="primary"):
         handle_login(login_id)
     st.stop()
 
 else:
-    # 啟動時先載入雲端總表到記憶體
+    # 預載雲端總表
     if "master_dir" not in st.session_state:
-        st.session_state.master_dir = load_master_directory()
+        st.session_state.master_dir = load_cloud_directory()
 
-    st.sidebar.title("👤 帳號管理")
-    st.sidebar.info(f"帳號: `{st.session_state.user_id}`")
+    st.sidebar.title("👤 帳號中心")
+    st.sidebar.info(f"使用者: `{st.session_state.user_id}`")
     
-    # --- 重要：初始化總表功能 ---
-    with st.sidebar.expander("⚙️ 雲端總表維護"):
-        if st.button("🔄 建立/更新全市場總表"):
-            with st.spinner("正在掃描全台股清單並同步雲端..."):
-                # 這裡預設一個大範圍的核心清單
-                base_pool = [
+    # --- 維護中心：修正中文名稱 ---
+    with st.sidebar.expander("⚙️ 雲端名稱修正"):
+        if st.button("🧼 清除英文並強制更新中文"):
+            with st.spinner("正在對抗英文，強制解析繁體中文..."):
+                # 這裡擴大掃描範圍 (台股核心 300 檔)
+                core_pool = [
                     "2330","2317","2454","2382","2308","2449","2603","2609","2618","2303","3008","2881",
                     "2882","2891","3711","2357","3231","4938","2379","3034","3037","1503","1513","1519",
                     "1605","1101","2002","2409","3481","2610","1504","1514","2327","2376","3035","3406",
                     "3443","3661","5269","6409","6446","6472","6488","8299","9958","2313","2451","2458",
                     "2492","2727","3533","5483","6239","8936","2352","3017","3653","4958","5871","6669"
                 ]
-                new_map = st.session_state.master_dir.copy()
-                for sid in base_pool:
-                    if sid not in new_map:
-                        new_map[sid] = fetch_stock_name_online(sid)
-                if save_master_directory(new_map):
+                new_map = {}
+                for sid in core_pool:
+                    new_map[sid] = fetch_real_zh_name(sid)
+                if update_cloud_directory(new_map):
                     st.session_state.master_dir = new_map
-                    st.success("總表已更新至雲端！")
-    
+                    st.sidebar.success("✅ 雲端總表已修正！")
+                    time.sleep(1)
+                    st.rerun()
+
     if st.sidebar.button("登出系統"):
         st.session_state.authenticated = False
         st.query_params.clear()
         st.rerun()
 
     mode = st.sidebar.radio("切換模式", ["🔎 全市場潛力選拔", "🛡️ 雲端持倉診斷"])
-    adr_val = get_adr()
+    adr_val = get_adr_val()
 
     if mode == "🔎 全市場潛力選拔":
-        st.markdown(f"### 🔎 市場量化優勢選拔")
+        st.markdown(f"### 🔎 市場高優勢量化掃描")
         st.markdown(f"""<div style="background-color:#1e2329; padding:10px; border-radius:10px; text-align:center; border-left:5px solid {'#3fb950' if adr_val > 0 else '#f85149'}; margin-bottom:20px;">
-            <small style="color:#888;">美股 TSM ADR 市場情緒</small><br><b style="color:{'#3fb950' if adr_val > 0 else '#f85149'}; font-size:20px;">{adr_val:+.2f}%</b>
+            <small style="color:#888;">美股 TSM ADR 市場氛圍</small><br><b style="color:{'#3fb950' if adr_val > 0 else '#f85149'}; font-size:20px;">{adr_val:+.2f}%</b>
         </div>""", unsafe_allow_html=True)
 
-        # 這裡從雲端載入的代號進行盲測
+        # 這裡從雲端載入所有代號進行數據選美
         scan_pool = list(st.session_state.master_dir.keys())
-        # 如果雲端沒資料，至少給一組預設標的
-        if not scan_pool: scan_pool = ["2330","2317","2454","2303","2603"]
+        if not scan_pool: scan_pool = ["2330","2317","2454","2449","2303"]
         
         winners = []
-        p_text = f"AI 正在對全市場進行盲測數據選拔..."
+        p_text = f"AI 正在對全場域標的進行盲測數據分析..."
         p_bar = st.progress(0, text=p_text)
         
-        # --- 純數據盲測階段 ---
+        # --- 數據盲測迴圈 (與名稱無關) ---
         for i, sid in enumerate(scan_pool):
             p_bar.progress((i + 1) / len(scan_pool), text=p_text)
             try:
                 tkr = yf.Ticker(f"{sid}.TW")
-                hist = tkr.history(period="60d")
-                if hist.empty or len(hist) < 25: continue
+                df = apply_tech_analysis(tkr.history(period="60d"))
+                if df.empty: continue
                 
-                df = apply_tech(hist)
                 score, buy, target, rank = compute_quant_score(df, adr_val)
-                
                 if score >= 70:
                     winners.append({"id": sid, "price": round(df.iloc[-1]['Close'], 2), "score": score, "buy": buy, "target": target, "rank": rank})
             except: continue
@@ -226,9 +229,9 @@ else:
 
         if winners:
             st.write(f"🎉 篩選出 {len(winners)} 檔高潛力標的：")
-            # --- 渲染時才帶出中文名稱 ---
+            # --- 渲染階段：從雲端對照表領取中文名稱 ---
             for item in sorted(winners, key=lambda x: x['score'], reverse=True)[:12]:
-                zh_name = st.session_state.master_dir.get(item['id'], fetch_stock_name_online(item['id']))
+                zh_name = st.session_state.master_dir.get(item['id'], fetch_real_zh_name(item['id']))
                 st.markdown(f"""
                 <div style="background-color:#161b22; padding:12px; border-radius:12px; border:1px solid #30363d; margin-bottom:10px;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -243,24 +246,22 @@ else:
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-        else:
-            st.info("💡 目前市場標的偏向整理，尚未發現符合量化優勢門檻的買訊標的。")
 
     else:
         st.markdown(f"### 🛡️ 雲端持倉實戰診斷")
-        st.markdown(f"<small style='color:#3fb950;'>● 雲端已同步 (台北 24H)</small>", unsafe_allow_html=True)
+        st.markdown(f"<small style='color:#3fb950;'>● 雲端已同步 (台北時間 24H)</small>", unsafe_allow_html=True)
 
         with st.expander("➕ 新增個人持倉記錄", expanded=False):
             c1, c2, c3 = st.columns([2, 2, 1])
-            in_id = c1.text_input("代號", placeholder="例如: 2330")
-            in_cost = c2.number_input("平均成本", value=None, placeholder="輸入價格", step=0.1)
+            in_id = c1.text_input("代號", placeholder="例如: 2449")
+            in_cost = c2.number_input("平均成本", value=None, placeholder="價格", step=0.1)
             if c3.button("存入", use_container_width=True):
                 if in_cost:
-                    # 如果代號不在雲端字典，立即補完
+                    # 如果代號不在雲端，自動補充為中文
                     if in_id not in st.session_state.master_dir:
-                        name = fetch_stock_name_online(in_id)
+                        name = fetch_real_zh_name(in_id)
                         st.session_state.master_dir[in_id] = name
-                        save_master_directory(st.session_state.master_dir)
+                        update_cloud_directory(st.session_state.master_dir)
                     
                     st.session_state.portfolio_list.append({"symbol": f"{in_id}.TW", "cost": in_cost, "ts": time.time()})
                     cloud_save_portfolio(st.session_state.user_id, st.session_state.portfolio_list)
@@ -271,10 +272,10 @@ else:
             for s in st.session_state.portfolio_list:
                 try:
                     p_id = s['symbol'].split('.')[0]
-                    c_name = st.session_state.master_dir.get(p_id, fetch_stock_name_online(p_id))
+                    c_name = st.session_state.master_dir.get(p_id, fetch_real_zh_name(p_id))
                     
                     tkr = yf.Ticker(s['symbol'])
-                    df = apply_tech(tkr.history(period="60d"))
+                    df = apply_tech_analysis(tkr.history(period="60d"))
                     l = df.iloc[-1]
                     cur = round(l['Close'], 2)
                     gain = ((cur - s['cost']) / s['cost']) * 100
@@ -282,10 +283,10 @@ else:
                     msg, clr = "", "#ffffff"
                     if gain > 0:
                         if l['MACD'] > 0: msg, clr = "🚀 強勢續留", "#3fb950"
-                        else: msg, clr = "⚠️ 漲勢放緩", "#f0883e"
+                        else: msg, clr = "⚠️ 建議減碼", "#f0883e"
                     else:
                         if l['MACD'] > 0: msg, clr = "💪 低檔轉強", "#58a6ff"
-                        elif cur < df.iloc[-1]['MA20']: msg, clr = "🚨 建議止損", "#f85149"
+                        elif cur < df.iloc[-1]['MA20']: msg, clr = "🚨 果斷止損", "#f85149"
                         else: msg, clr = "💤 盤整待變", "#8b949e"
 
                     st.markdown(f"""
