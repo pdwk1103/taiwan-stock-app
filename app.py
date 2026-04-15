@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 # --- 頁面配置 ---
 st.set_page_config(page_title="台股 AI 雲端實戰", layout="centered", initial_sidebar_state="collapsed")
 
-# --- 0. 台北時間工具 (24小時制優化) ---
+# --- 0. 台北時間工具 (24小時制) ---
 def get_taipei_now():
     """獲取目前的台北時間 (UTC+8)"""
     tz = timezone(timedelta(hours=8))
@@ -33,7 +33,7 @@ def init_db():
 db = init_db()
 app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v2")
 
-# --- 2. 雲端核心邏輯 ---
+# --- 2. 雲端核心邏輯 (增加 API 未啟用檢查) ---
 def cloud_save(uid, data):
     if not db or not uid: return False
     try:
@@ -45,7 +45,10 @@ def cloud_save(uid, data):
         })
         return True
     except Exception as e:
-        st.error(f"雲端儲存失敗: {e}")
+        if "SERVICE_DISABLED" in str(e):
+            st.error("❌ 雲端服務未啟用：請前往 Google Cloud Console 點擊『啟用 Cloud Firestore API』。")
+        else:
+            st.error(f"雲端儲存失敗: {e}")
         return False
 
 def cloud_load(uid):
@@ -56,7 +59,9 @@ def cloud_load(uid):
         if doc.exists:
             return doc.to_dict().get("items", [])
         return []
-    except:
+    except Exception as e:
+        if "SERVICE_DISABLED" in str(e):
+            st.warning("⚠️ 雲端服務未啟用，目前僅能使用暫存模式。")
         return []
 
 # --- 3. 登入與持久化管理 ---
@@ -187,7 +192,9 @@ else:
 
     else:
         st.markdown(f"### 🛡️ 持倉診斷 - {st.session_state.user_id}")
-        st.markdown(f"<small style='color:#3fb950;'>● 雲端資料庫已連線 (24H 台北時間)</small>", unsafe_allow_html=True)
+        
+        db_status = "🟢 雲端已連線" if db else "🔴 雲端未就緒"
+        st.markdown(f"<small style='color:#3fb950;'>● {db_status} (24H 台北時間)</small>", unsafe_allow_html=True)
 
         with st.expander("➕ 新增持倉記錄", expanded=False):
             c1, c2, c3 = st.columns([2, 2, 1])
@@ -243,4 +250,3 @@ else:
     # 底部顯示台北時間 (24小時制)
     now_tp = get_taipei_now()
     st.caption(f"最後同步 (台北時間 24H): {now_tp.strftime('%Y-%m-%d %H:%M:%S')}")
-
