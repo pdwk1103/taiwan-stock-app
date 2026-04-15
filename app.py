@@ -3,19 +3,26 @@ import yfinance as yf
 import pandas as pd
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from google.cloud import firestore
 from google.oauth2 import service_account
 
 # --- 頁面配置 ---
 st.set_page_config(page_title="台股 AI 雲端實戰", layout="centered", initial_sidebar_state="collapsed")
 
-# --- 1. Firebase 初始化 ---
+# --- 0. 台北時間工具 (24小時制優化) ---
+def get_taipei_now():
+    """獲取目前的台北時間 (UTC+8)"""
+    tz = timezone(timedelta(hours=8))
+    return datetime.now(tz)
+
+# --- 1. Firebase / Firestore 初始化 ---
 @st.cache_resource
 def init_db():
     try:
         if "firebase" in st.secrets:
             creds_dict = dict(st.secrets["firebase"])
+            # 確保私鑰換行符號正確
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = service_account.Credentials.from_service_account_info(creds_dict)
             return firestore.Client(credentials=creds)
@@ -28,43 +35,51 @@ app_id = st.secrets.get("general", {}).get("app_id", "stock_ai_v2")
 
 # --- 2. 雲端核心邏輯 ---
 def cloud_save(uid, data):
-    if not db or not uid: return
+    if not db or not uid: return False
     try:
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
-        doc_ref.set({"items": data, "updated": datetime.now()})
-    except: pass
+        doc_ref.set({
+            "items": data,
+            "last_updated": get_taipei_now(),
+            "user_id": uid
+        })
+        return True
+    except Exception as e:
+        st.error(f"雲端儲存失敗: {e}")
+        return False
 
 def cloud_load(uid):
     if not db or not uid: return []
     try:
         doc_ref = db.collection("artifacts").document(app_id).collection("users").document(uid).collection("portfolio").document("data")
         doc = doc_ref.get()
-        return doc.to_dict().get("items", []) if doc.exists else []
-    except: return []
+        if doc.exists:
+            return doc.to_dict().get("items", [])
+        return []
+    except:
+        return []
 
-# --- 3. 登入與 Session 狀態管理 ---
-# 檢查 URL 是否帶有 uid 參數 (實現自動登入)
-query_params = st.query_params
-if "uid" in query_params and "user_id" not in st.session_state:
-    st.session_state.user_id = query_params["uid"]
-    st.session_state.authenticated = True
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-# 登入處理函式
-def login_user(uid):
-    if uid.strip():
-        st.session_state.user_id = uid.strip()
+# --- 3. 登入與持久化管理 ---
+if "user_id" not in st.session_state:
+    qp = st.query_params
+    if "uid" in qp:
+        st.session_state.user_id = qp["uid"]
         st.session_state.authenticated = True
-        st.session_state.portfolio_list = cloud_load(uid.strip())
-        # 將 uid 寫入網址參數，以便下次自動登入
-        st.query_params["uid"] = uid.strip()
-        st.rerun()
+        st.session_state.portfolio_list = cloud_load(qp["uid"])
     else:
-        st.error("請輸入有效的通行碼")
+        st.session_state.authenticated = False
+        st.session_state.user_id = ""
 
-# --- 4. 技術面工具 ---
+def handle_login(uid):
+    uid = uid.strip()
+    if uid:
+        st.session_state.user_id = uid
+        st.session_state.authenticated = True
+        st.session_state.portfolio_list = cloud_load(uid)
+        st.query_params["uid"] = uid 
+        st.rerun()
+
+# --- 4. 技術分析與行情工具 ---
 def get_tick(p):
     if p < 10: return 0.01
     elif p < 50: return 0.05
@@ -85,14 +100,24 @@ def compute_tech(df):
     return df
 
 @st.cache_data(ttl=3600)
-def get_adr():
+def get_stock_cname(symbol):
+    try:
+        res = requests.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={symbol}&lang=zh-Hant-TW&region=TW", headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        for q in res.json().get('quotes', []):
+            if q.get('symbol') == symbol:
+                return q.get('shortname') or q.get('longname') or symbol
+    except: pass
+    return symbol
+
+@st.cache_data(ttl=3600)
+def get_adr_val():
     try:
         tsm = yf.Ticker("TSM").history(period="2d")
         return round(((tsm['Close'].iloc[-1] - tsm['Close'].iloc[-2]) / tsm['Close'].iloc[-2]) * 100, 2)
     except: return 0.0
 
-def find_stock(q):
-    if q.isdigit() and len(q) >= 4: return f"{q}.TW", q
+def find_stock_data(q):
+    if q.isdigit() and len(q) >= 4: return f"{q}.TW", get_stock_cname(f"{q}.TW")
     try:
         res = requests.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={q}&lang=zh-Hant-TW&region=TW", headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
         for quote in res.json().get('quotes', []):
@@ -101,29 +126,24 @@ def find_stock(q):
     except: pass
     return None, None
 
-# --- 5. 介面渲染邏輯 ---
+# --- 5. 介面渲染 ---
 
-# 登入頁面
 if not st.session_state.authenticated:
-    st.markdown("<div style='height: 100px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 80px;'></div>", unsafe_allow_html=True)
     st.markdown("<h1 style='text-align: center; color: #58a6ff;'>🚀 AI 實戰航線</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #8b949e;'>請輸入您的雲端通行碼以開啟功能</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #8b949e;'>輸入通行碼即可同步雲端持倉</p>", unsafe_allow_html=True)
     
     with st.container():
-        st.markdown("<div style='background-color: #161b22; padding: 30px; border-radius: 20px; border: 1px solid #30363d;'>", unsafe_allow_html=True)
-        login_id = st.text_input("個人通行碼 (Passcode)", placeholder="例如: Alex770801", label_visibility="collapsed")
-        if st.button("確認登入", use_container_width=True, type="primary"):
-            login_user(login_id)
+        st.markdown("<div style='background-color: #161b22; padding: 25px; border-radius: 15px; border: 1px solid #30363d;'>", unsafe_allow_html=True)
+        login_id = st.text_input("通行碼", placeholder="例如: Alex770801", label_visibility="collapsed")
+        if st.button("確認登入並同步", use_container_width=True, type="primary"):
+            handle_login(login_id)
         st.markdown("</div>", unsafe_allow_html=True)
-        
-    st.markdown("<p style='text-align: center; font-size: 12px; color: #444; margin-top: 20px;'>提示：登入後請將網址加入書籤，下次可自動登入</p>", unsafe_allow_html=True)
     st.stop()
 
-# 主功能頁面
 else:
-    # 側邊欄改為顯示用戶資訊與登出按鈕
-    st.sidebar.title("👤 帳號資訊")
-    st.sidebar.write(f"當前帳號: `{st.session_state.user_id}`")
+    st.sidebar.title("👤 個人資訊")
+    st.sidebar.info(f"帳號: `{st.session_state.user_id}`")
     if st.sidebar.button("登出帳號"):
         st.session_state.authenticated = False
         st.session_state.user_id = ""
@@ -131,58 +151,61 @@ else:
         st.rerun()
     
     st.sidebar.divider()
-    mode = st.sidebar.radio("功能模組", ["📢 AI 盤前推薦", "🛡️ 雲端持倉管理"])
+    mode = st.sidebar.radio("切換功能", ["📢 AI 盤前推薦", "🛡️ 雲端持倉管理"])
     discount = st.sidebar.slider("券商折扣", 0.1, 1.0, 0.6)
     
-    # 初始化資料
-    if "portfolio_list" not in st.session_state:
-        st.session_state.portfolio_list = cloud_load(st.session_state.user_id)
-
-    adr_val = get_adr()
+    adr = get_adr_val()
 
     if mode == "📢 AI 盤前推薦":
-        st.markdown(f"<h3 style='text-align: center; font-size: 20px;'>📢 AI 推薦 - {st.session_state.user_id}</h3>", unsafe_allow_html=True)
-        st.markdown(f"""<div style="background-color:#1e2329; padding:10px; border-radius:10px; text-align:center; margin-bottom:15px; border-left:5px solid {'#3fb950' if adr_val > 0 else '#f85149'};"><span style="color:#888; font-size:12px;">美股 TSM ADR 連動</span><br><b style="color:{'#3fb950' if adr_val > 0 else '#f85149'}; font-size:18px;">{adr_val:+.2f}%</b></div>""", unsafe_allow_html=True)
+        st.markdown(f"### 📢 今日 AI 推薦 - {st.session_state.user_id}")
+        st.markdown(f"""<div style="background-color:#1e2329; padding:8px; border-radius:8px; text-align:center; border-left:5px solid {'#3fb950' if adr > 0 else '#f85149'}; margin-bottom:15px;">
+            <small style="color:#888;">TSM ADR 連動</small> <b style="color:{'#3fb950' if adr > 0 else '#f85149'};">{adr:+.2f}%</b>
+        </div>""", unsafe_allow_html=True)
 
         scan_list = ["2449", "2330", "2317", "2603", "2618", "2382", "2454", "3008", "2609", "3231"]
         recs = []
-        with st.spinner("分析中..."):
+        with st.spinner("AI 正在獲取最新行情..."):
             for sid in scan_list:
                 try:
-                    tkr = yf.Ticker(f"{sid}.TW")
+                    full_sid = f"{sid}.TW"
+                    tkr = yf.Ticker(full_sid)
                     df = compute_tech(tkr.history(period="60d"))
                     l, p = df.iloc[-1], df.iloc[-2]
-                    score = 50 + (adr_val * 2)
+                    score = 50 + (adr * 2)
                     if l['Close'] > l['MA5']: score += 15
                     if l['K'] > l['D'] and p['K'] <= p['D']: score += 15
                     if l['MACD'] > 0: score += 10
+                    
                     if score >= 60:
                         t = get_tick(l['Close'])
-                        recs.append({"id": sid, "name": tkr.info.get('shortName', sid), "price": round(l['Close'], 2), "score": int(score), "buy": round(max(l['MA5'], l['Close'] - t), 2), "target": round(l['Close'] + t * 8, 2)})
+                        cname = get_stock_cname(full_sid)
+                        recs.append({"id": sid, "name": cname, "price": round(l['Close'], 2), "score": int(score), "buy": round(max(l['MA5'], l['Close'] - t), 2), "target": round(l['Close'] + t * 8, 2)})
                 except: continue
 
         for item in sorted(recs, key=lambda x: x['score'], reverse=True):
-            st.markdown(f"""<div style="background-color:#161b22; padding:15px; border-radius:12px; border:1px solid #30363d; margin-bottom:12px;"><div style="display:flex; justify-content:space-between;"><b>{item['name']} ({item['id']})</b><span style="color:#3fb950;">分: {item['score']}</span></div><div style="display:flex; justify-content:space-between; margin-top:8px; background:#0d1117; padding:10px; border-radius:8px;"><div style="text-align:center;"><small style="color:#888;">買點</small><br><b style="color:#3fb950;">{item['buy']}</b></div><div style="text-align:center;"><small style="color:#888;">目標</small><br><b style="color:#58a6ff;">{item['target']}</b></div><div style="text-align:center;"><small style="color:#888;">現價</small><br><b>{item['price']}</b></div></div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div style="background-color:#161b22; padding:12px; border-radius:10px; border:1px solid #30363d; margin-bottom:10px;"><div style="display:flex; justify-content:space-between;"><b>{item['name']} ({item['id']})</b><span style="color:#3fb950;">分: {item['score']}</span></div><div style="display:flex; justify-content:space-between; margin-top:5px; background:#0d1117; padding:8px; border-radius:8px;"><div style="text-align:center;"><small style="color:#888;">建議買點</small><br><b style="color:#3fb950;">{item['buy']}</b></div><div style="text-align:center;"><small style="color:#888;">目標獲利</small><br><b style="color:#58a6ff;">{item['target']}</b></div><div style="text-align:center;"><small style="color:#888;">現價</small><br><b>{item['price']}</b></div></div></div>""", unsafe_allow_html=True)
 
     else:
-        st.markdown(f"<h3 style='text-align: center; font-size: 20px;'>🛡️ 持倉診斷 - {st.session_state.user_id}</h3>", unsafe_allow_html=True)
-        
-        with st.expander("➕ 新增持倉", expanded=False):
+        st.markdown(f"### 🛡️ 持倉診斷 - {st.session_state.user_id}")
+        st.markdown(f"<small style='color:#3fb950;'>● 雲端資料庫已連線 (24H 台北時間)</small>", unsafe_allow_html=True)
+
+        with st.expander("➕ 新增持倉記錄", expanded=False):
             c1, c2, c3 = st.columns([2, 2, 1])
-            new_id = c1.text_input("代號/名稱", placeholder="2449")
-            new_cost = c2.number_input("買進成本", value=None, placeholder="輸入價格", step=0.1)
-            if c3.button("儲存", use_container_width=True):
+            new_id = c1.text_input("名稱/代號", placeholder="2449")
+            new_cost = c2.number_input("成本", value=None, placeholder="輸入單價", step=0.1)
+            if c3.button("存入", use_container_width=True):
                 if new_cost:
-                    sym, name = find_stock(new_id)
+                    sym, name = find_stock_data(new_id)
                     if sym:
                         st.session_state.portfolio_list.append({"symbol": sym, "name": name, "cost": new_cost, "ts": time.time()})
-                        cloud_save(st.session_state.user_id, st.session_state.portfolio_list)
-                        st.success("已同步")
-                        st.rerun()
-                else: st.error("請輸入價格")
+                        if cloud_save(st.session_state.user_id, st.session_state.portfolio_list):
+                            st.success(f"已同步雲端: {name}")
+                            time.sleep(0.5)
+                            st.rerun()
+                else: st.error("請填寫成本")
 
         if not st.session_state.portfolio_list:
-            st.info("尚無雲端紀錄")
+            st.info("目前雲端尚無紀錄")
         else:
             del_ts = None
             for s in st.session_state.portfolio_list:
@@ -209,9 +232,15 @@ else:
 
             if del_ts:
                 st.session_state.portfolio_list = [i for i in st.session_state.portfolio_list if i.get('ts') != del_ts]
-                cloud_save(st.session_state.user_id, st.session_state.portfolio_list)
-                st.rerun()
+                if cloud_save(st.session_state.user_id, st.session_state.portfolio_list):
+                    st.rerun()
 
-    st.write("---")
-    st.caption(f"帳號: {st.session_state.user_id} | 更新於: {datetime.now().strftime('%H:%M:%S')}")
+    st.divider()
+    if st.button("🔄 立即同步雲端資料"):
+        st.session_state.portfolio_list = cloud_load(st.session_state.user_id)
+        st.rerun()
+    
+    # 底部顯示台北時間 (24小時制)
+    now_tp = get_taipei_now()
+    st.caption(f"最後同步 (台北時間 24H): {now_tp.strftime('%Y-%m-%d %H:%M:%S')}")
 
