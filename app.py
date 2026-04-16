@@ -7,44 +7,40 @@ from datetime import datetime, timedelta, timezone
 from google.cloud import firestore
 from google.oauth2 import service_account
 
-# --- 頁面配置 ---
+# --- 頁面配置 (針對 iPhone PWA 模式優化) ---
 st.set_page_config(
     page_title="台股 AI 實戰", 
     layout="centered", 
     initial_sidebar_state="collapsed"
 )
 
-# --- 0. 配置中心 (API Key 強制去空格) ---
-RAW_KEY = "ZDEwODViOGItZDEzNC00MWQ2LTg4M2ItMzE2N2MwMTM5NDYw"
-FUGLE_API_KEY = RAW_KEY.strip()
+# --- 0. 配置中心 (更新 API Key 並自動校正) ---
+# 您提供的金鑰包含空格與 Base64 結尾符號 ==，我們在此進行清洗
+RAW_KEY = "ODVhODhhZjYtNTRhOC00ZDk2LWJjY2ItOTdkMmYyNjI5MzY2IDczYjg3MmE0LTdhMTEtNDdjNC05OTMyLWFmYjA3YmRiMjBiNQ=="
+FUGLE_API_KEY = RAW_KEY.replace(" ", "").strip()
 
 def get_taipei_now():
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz)
 
-# --- 1. 富果 API 連線與數據解析 ---
-def check_fugle_connection():
-    """
-    連線測試與診斷
-    """
-    # 測試台積電行情
+# --- 1. 富果 API 連線與數據擷取 ---
+def check_fugle_status():
+    """驗證 API Key 連線狀態並診斷 401 錯誤"""
+    # 測試台積電 2330 行情
     test_url = "https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/2330"
     headers = {"X-FUGLE-API-KEY": FUGLE_API_KEY}
     try:
         res = requests.get(test_url, headers=headers, timeout=5)
         if res.status_code == 200:
-            return True, "🟢 連線成功 (v1.0)"
+            return True, "🟢 已連線 (富果 v1.0)"
         elif res.status_code == 401:
-            return False, "🔴 權限錯誤 (401): 請至富果後台確認 Market Data 服務已開啟"
-        elif res.status_code == 403:
-            return False, "🔴 拒絕存取 (403): 金鑰可能已失效或額度已滿"
-        else:
-            return False, f"🟠 異常狀態: {res.status_code}"
-    except Exception as e:
-        return False, f"⚪ 網路連線失敗: {str(e)[:20]}"
+            return False, "🔴 權限錯誤 (401): 請確認富果後台已開啟 Market Data 權限"
+        return False, f"🟠 錯誤代碼: {res.status_code}"
+    except:
+        return False, "⚪ 網路請求異常"
 
-def get_fugle_data_v1(symbol):
-    """取得秒級即時行情"""
+def get_fugle_realtime(symbol):
+    """取得富果秒級即時行情 (REST 請求模式)"""
     url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{symbol}"
     headers = {"X-FUGLE-API-KEY": FUGLE_API_KEY}
     try:
@@ -92,7 +88,7 @@ def cloud_save_portfolio(uid, data):
         return True
     except: return False
 
-def load_master_dir():
+def load_master_directory():
     if not db: return {}
     try:
         doc_ref = db.collection("artifacts").document(app_id).collection("public").document("data").collection("directory").document("master_list")
@@ -100,7 +96,7 @@ def load_master_dir():
         return doc.to_dict().get("mapping", {}) if doc.exists else {}
     except: return {}
 
-# --- 3. 登入記憶邏輯 ---
+# --- 3. 記憶登入邏輯 (URL 驅動) ---
 qp = st.query_params
 url_uid = qp.get("uid", None)
 
@@ -121,7 +117,7 @@ def handle_login(uid):
         st.query_params["uid"] = uid 
         st.rerun()
 
-# --- 4. 產業與分析邏輯 (漏斗架構) ---
+# --- 4. 產業分類與分析引擎 ---
 CATEGORY_GROUPS = {
     "電子/半導體": ["2330","2317","2454","2382","2308","2449","3711","2303","3034","3037","3231","4938","2379","2353","3008","2376","3017","6669","2313","2451","2458","2492","2327","3035","3406","3443","3661","5269","6409","6488","8299"],
     "金融/保險": ["2881","2882","2886","2891","2884","2885","2880","2887","5880","2890","2892","5871","2883","2888","2834"],
@@ -129,12 +125,13 @@ CATEGORY_GROUPS = {
     "觀光/生技/其他": ["6446","6472","1760","1712","1723","2912","9910","9921","9904","2727","8454"]
 }
 
-def apply_tech(df, live=None):
+def apply_tech_analysis(df, live_snap=None):
     if len(df) < 25: return df
-    if live and live['p']:
-        df.iloc[-1, df.columns.get_loc('Close')] = live['p']
-        if live['h']: df.iloc[-1, df.columns.get_loc('High')] = live['h']
-        if live['l']: df.iloc[-1, df.columns.get_loc('Low')] = live['l']
+    # 注入富果即時數據 (若可用)
+    if live_snap and live_snap['p']:
+        df.iloc[-1, df.columns.get_loc('Close')] = live_snap['p']
+        if live_snap['h']: df.iloc[-1, df.columns.get_loc('High')] = live_snap['h']
+        if live_snap['l']: df.iloc[-1, df.columns.get_loc('Low')] = live_snap['l']
     
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -145,27 +142,27 @@ def apply_tech(df, live=None):
     df['MACD'] = (e12 - e26 - (e12 - e26).ewm(span=9).mean()) * 2
     return df
 
-def get_evaluation(df, adr, live=None):
+def get_final_rating(df, adr, live_snap=None):
     l, p = df.iloc[-1], df.iloc[-2]
     score = 35 + (adr * 2.3)
     if l['Close'] > l['MA5']: score += 15
     if l['K'] > l['D'] and p['K'] <= p['D']: score += 20
     if l['MACD'] > 0: score += 15
     
-    vol_tag = "量能穩定"
-    if live:
+    v_msg = "量能穩定"
+    if live_snap:
         avg_v = df['Volume'].tail(15).mean()
-        if live['v'] > avg_v * 1.5: 
+        if live_snap['v'] > avg_v * 1.6: 
             score += 10
-            vol_tag = "🔥 盤中爆量"
+            v_msg = "🔥 盤中大幅放量"
     
-    rank = "🚀 強力推薦" if score >= 85 else "✅ 建議布局" if score >= 75 else "觀察"
+    rank = "🚀 強力推薦" if score >= 85 else "✅ 建議布局" if score >= 75 else "觀望整理"
     buy = round(max(l['MA5'], l['Close'] * 0.993), 2)
     target = round(l['Close'] * 1.055, 2)
-    return int(score), buy, target, rank, vol_tag
+    return int(score), buy, target, rank, v_msg
 
 @st.cache_data(ttl=3600)
-def get_adr():
+def get_adr_sentiment():
     try:
         tsm = yf.Ticker("TSM").history(period="2d")
         return round(((tsm['Close'].iloc[-1] - tsm['Close'].iloc[-2]) / tsm['Close'].iloc[-2]) * 100, 2)
@@ -176,48 +173,49 @@ def get_adr():
 if not st.session_state.get("authenticated", False):
     st.markdown("<div style='height: 100px;'></div>", unsafe_allow_html=True)
     st.markdown("<h1 style='text-align: center; color: #58a6ff;'>🚀 AI 實戰選股中心</h1>", unsafe_allow_html=True)
-    login_id = st.text_input("通行碼", placeholder="例如: MyStockPlan", label_visibility="collapsed")
-    if st.button("確認進入並載入資料", use_container_width=True, type="primary"):
+    login_id = st.text_input("輸入帳號通行碼", placeholder="例如: AlexTrader", label_visibility="collapsed")
+    if st.button("登入並同步數據", use_container_width=True, type="primary"):
         handle_login(login_id)
     st.stop()
 
 else:
     if "master_dir" not in st.session_state:
-        st.session_state.master_dir = load_master_dir()
+        st.session_state.master_dir = load_master_directory()
     
-    # --- 狀態列 (具備詳細診斷功能) ---
-    is_f_ok, f_msg = check_fugle_connection()
-    adr_val = get_adr()
+    # 頂端狀態列 (加入富果金鑰診斷)
+    is_f_ok, f_msg = check_fugle_status()
+    adr_val = get_adr_sentiment()
     
     st.markdown(f"""
     <div style="display: flex; justify-content: space-between; margin-bottom: 15px;">
-        <div style="background: #1e2329; padding: 8px 15px; border-radius: 10px; border-left: 5px solid {'#3fb950' if is_f_ok else '#f85149'}; flex: 1.5; margin-right: 10px;">
-            <small style="color: #8b949e;">Fugle 即時連線狀態</small><br><b style="color: {'#3fb950' if is_f_ok else '#f85149'}; font-size: 13px;">{f_msg}</b>
+        <div style="background: #1e2329; padding: 6px 15px; border-radius: 10px; border-left: 5px solid {'#3fb950' if is_f_ok else '#f85149'}; flex: 1.6; margin-right: 10px;">
+            <small style="color: #8b949e;">Fugle 實時狀態</small><br><b style="color: {'#3fb950' if is_f_ok else '#f85149'}; font-size: 13px;">{f_msg}</b>
         </div>
-        <div style="background: #1e2329; padding: 8px 15px; border-radius: 10px; border-left: 5px solid {'#3fb950' if adr_val > 0 else '#f85149'}; text-align: right; flex: 1;">
-            <small style="color: #8b949e;">TSM ADR</small><br><b style="color: {'#3fb950' if adr_val > 0 else '#f85149'};">{adr_val:+.2f}%</b>
+        <div style="background: #1e2329; padding: 6px 15px; border-radius: 10px; border-left: 5px solid {'#3fb950' if adr_val > 0 else '#f85149'}; text-align: right; flex: 1;">
+            <small style="color: #8b949e;">TSM ADR</small><br><b style="color: {'#3fb950' if adr_val > 0 else '#f85149'}; font-size: 13px;">{adr_val:+.2f}%</b>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.sidebar.title("👤 帳號管理")
+    st.sidebar.title("👤 個人空間")
     st.sidebar.info(f"帳號: `{st.session_state.user_id}`")
     if not url_uid:
-        st.sidebar.success("💡 記憶登入：點擊 Safari「分享」並選擇「加入主畫面」，即可達成自動登入。")
-    if st.sidebar.button("登出系統"):
+        st.sidebar.success("💡 技巧： Safari分享 -> 加入主畫面，可實現自動登入！")
+    if st.sidebar.button("登出帳號"):
         st.session_state.authenticated = False
         st.query_params.clear()
         st.rerun()
     
-    mode = st.sidebar.radio("切換模式", ["🔎 即時選拔分析", "🛡️ 持倉實時診斷"])
+    mode = st.sidebar.radio("功能切換", ["🔎 即時選拔分析", "🛡️ 持倉實時診斷"])
 
     if mode == "🔎 即時選拔分析":
         c1, c2 = st.columns(2)
         with c1:
             sel_cat = st.selectbox("📂 產業類別", ["全部"] + list(CATEGORY_GROUPS.keys()))
         with c2:
-            sel_price = st.selectbox("💰 價位分級", ["全部", "<50", "50-100", "100-500", "500-1000", ">1000"])
+            sel_price = st.selectbox("💰 價位區間", ["全部", "<50", "50-100", "100-500", "500-1000", ">1000"])
 
+        # 掃描池
         if sel_cat == "全部":
             pool = [sid for g in CATEGORY_GROUPS.values() for sid in g]
         else:
@@ -225,7 +223,7 @@ else:
         pool = sorted(list(set(pool)))
         
         winners = []
-        p_bar = st.progress(0, text=f"AI 正在對 {len(pool)} 檔標的執行數據盲測...")
+        p_bar = st.progress(0, text=f"正在盲測 {len(pool)} 檔標的數據...")
         
         for i, sid in enumerate(pool):
             p_bar.progress((i + 1) / len(pool))
@@ -234,54 +232,55 @@ else:
                 df_h = tkr.history(period="60d")
                 if df_h.empty: continue
                 
+                # 第一階段：價格初步過濾 (Yahoo)
                 cur_p = round(df_h.iloc[-1]['Close'], 2)
-                p_match = False
-                if sel_price == "全部": p_match = True
-                elif sel_price == "<50" and cur_p < 50: p_match = True
-                elif sel_price == "50-100" and 50 <= cur_p < 100: p_match = True
-                elif sel_price == "100-500" and 100 <= cur_p < 500: p_match = True
-                elif sel_price == "500-1000" and 500 <= cur_p < 1000: p_match = True
-                elif sel_price == ">1000" and cur_p >= 1000: p_match = True
-                if not p_match: continue
+                p_ok = False
+                if sel_price == "全部": p_ok = True
+                elif sel_price == "<50" and cur_p < 50: p_ok = True
+                elif sel_price == "50-100" and 50 <= cur_p < 100: p_ok = True
+                elif sel_price == "100-500" and 100 <= cur_p < 500: p_ok = True
+                elif sel_price == "500-1000" and 500 <= cur_p < 1000: p_ok = True
+                elif sel_price == ">1000" and cur_p >= 1000: p_ok = True
+                if not p_ok: continue
                 
-                # 入圍者調用富果即時 (若 API 連線正常)
-                live = get_fugle_data_v1(sid) if is_f_ok else None
-                df = apply_tech(df_h, live)
-                score, buy, target, rank, v_msg = get_evaluation(df, adr_val, live)
+                # 第二階段：入圍者調用富果實時
+                live = get_fugle_realtime(sid) if is_f_ok else None
+                df = apply_tech_analysis(df_h, live)
+                score, buy, target, rank, v_msg = get_final_rating(df, adr_val, live)
                 
                 if score >= 70:
-                    src_tag = "富果即時" if live else "延遲數據"
-                    winners.append({"id": sid, "p": cur_p, "s": score, "b": buy, "t": target, "r": rank, "v": v_msg, "src": src_tag})
+                    t_str = live['t'].split('T')[1][:5] if live else "延遲"
+                    winners.append({"id": sid, "p": cur_p, "s": score, "b": buy, "t": target, "r": rank, "v": v_msg, "time": t_str})
             except: continue
         p_bar.empty()
 
         if winners:
-            st.write(f"🎉 盤中量化推薦 ({len(winners)})：")
+            st.write(f"🎉 盤中量化推薦 ({len(winners)}):")
             for item in sorted(winners, key=lambda x: x['s'], reverse=True)[:12]:
                 zh = st.session_state.master_dir.get(item['id'], item['id'])
                 st.markdown(f"""
                 <div style="background-color:#161b22; padding:12px; border-radius:12px; border:1px solid #30363d; margin-bottom:12px;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <b style="font-size:17px; color:#c9d1d9;">{zh} ({item['id']})</b>
-                        <span style="background:#238636; color:white; padding:2px 8px; border-radius:6px; font-size:10px;">{item['src']}</span>
+                        <span style="background:#238636; color:white; padding:2px 8px; border-radius:6px; font-size:10px;">富果 {item['time']}</span>
                     </div>
                     <div style="margin-top:5px; display:flex; justify-content:space-between;">
                         <small style="color:#3fb950; font-weight:bold;">{item['r']} | {item['v']}</small>
-                        <small style="color:#8b949e;">優勢評分: {item['s']}</small>
+                        <small style="color:#8b949e;">優勢分: {item['s']}</small>
                     </div>
                     <div style="display:flex; justify-content:space-between; margin-top:10px; background:#0d1117; padding:10px; border-radius:10px;">
                         <div style="text-align:center;"><small style="color:#8b949e;">建議買點</small><br><b style="color:#3fb950;">{item['b']}</b></div>
-                        <div style="text-align:center;"><small style="color:#8b949e;">預期目標</small><br><b style="color:#58a6ff;">{item['t']}</b></div>
-                        <div style="text-align:center;"><small style="color:#8b949e;">現價</small><br><b>{item['p']}</b></div>
+                        <div style="text-align:center;"><small style="color:#8b949e;">目標預期</small><br><b style="color:#58a6ff;">{item['t']}</b></div>
+                        <div style="text-align:center;"><small style="color:#8b949e;">盤中現價</small><br><b>{item['p']}</b></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.info("💡 目前市場標的偏向整理，暫無強勢買訊。")
+            st.info("💡 目前市場多處盤整，暫無強勢買訊標的。")
 
     else:
-        st.markdown(f"### 🛡️ 持倉實時診斷")
-        with st.expander("➕ 新增個人持倉", expanded=False):
+        st.markdown(f"### 🛡️ 持倉實時監控 (富果診斷)")
+        with st.expander("➕ 新增持倉", expanded=False):
             c1, c2, c3 = st.columns([2, 2, 1])
             in_id = c1.text_input("代號", placeholder="例如: 2330")
             in_cost = c2.number_input("成本", value=None, placeholder="價格", step=0.1)
@@ -297,13 +296,13 @@ else:
                 try:
                     p_id = s['symbol'].split('.')[0]
                     zh = st.session_state.master_dir.get(p_id, p_id)
-                    live = get_fugle_data_v1(p_id) if is_f_ok else None
+                    live = get_fugle_realtime(p_id) if is_f_ok else None
                     tkr = yf.Ticker(s['symbol'])
-                    df = apply_tech(tkr.history(period="60d"), live)
+                    df = apply_tech_analysis(tkr.history(period="60d"), live)
                     cur = live['p'] if live else round(df.iloc[-1]['Close'], 2)
                     gain = ((cur - s['cost']) / s['cost']) * 100
                     
-                    msg, clr = "數據載入中...", "#ffffff"
+                    msg, clr = "分析中...", "#ffffff"
                     if gain > 0:
                         msg, clr = ("🚀 強勢續留", "#3fb950") if df.iloc[-1]['MACD'] > 0 else ("⚠️ 建議減碼", "#f0883e")
                     else:
@@ -331,5 +330,5 @@ else:
                 st.rerun()
 
     st.divider()
-    st.caption(f"最後同步 (台北時間 24H): {get_taipei_now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"最後更新 (台北 24H): {get_taipei_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
