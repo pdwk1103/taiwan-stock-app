@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # --- 0. 配置中心 (直接寫入 API Key) ---
-FUGLE_API_KEY = "ZDEwODViOGItZDEzNC00MWQ2LTg4M2ItMzE2N2MwMTM5NDYw"
+FUGLE_API_KEY = "ZDEwODViOGItZDEzNC00MWQ2LTg4M2ItMzE2N2MwMTM5NDYw=="
 
 def get_taipei_now():
     tz = timezone(timedelta(hours=8))
